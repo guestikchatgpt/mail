@@ -1,11 +1,14 @@
-# modules/03_postfix.sh — базовая конфигурация Postfix
-# Требует: DOMAIN, HOSTNAME, IPV4; функции: run_cmd, log_*, require_cmd
-# Опирается на Dovecot (SASL/LMTP) в следующих модулях.
+# modules/03_postfix.sh — базовая конфигурация Postfix с виртуальными ящиками
+# Требует: DOMAIN, HOSTNAME, IPV4, VARS_FILE; функции: run_cmd, log_*, require_cmd
 # shellcheck shell=bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
 
 postfix::paths() {
   PF_MAIN="/etc/postfix/main.cf"
   PF_MAIN_BAK="/etc/postfix/main.cf.msa-bak"
+  VMAP_PATH="/etc/postfix/virtual_mailbox_maps"
   LE_FULL="/etc/letsencrypt/live/${HOSTNAME}/fullchain.pem"
   LE_KEY="/etc/letsencrypt/live/${HOSTNAME}/privkey.pem"
 }
@@ -19,30 +22,29 @@ postfix::write_main_cf() {
     run_cmd "cp -a '${PF_MAIN}' '${PF_MAIN_BAK}'"
   fi
 
-  # Генерируем минимальный opinionated main.cf
   local tmp; tmp="$(mktemp)"
   cat > "$tmp" <<EOF
 # Managed by msa-install — DO NOT EDIT
 compatibility_level = 3.6
 
 myhostname = ${HOSTNAME}
-mydomain = ${DOMAIN}
+mydomain   = ${DOMAIN}
+myorigin   = \$mydomain
 smtp_helo_name = \$myhostname
 
 # Не быть open relay
 mynetworks = 127.0.0.0/8
 mydestination = localhost
 relay_domains =
-smtpd_relay_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination
-smtpd_recipient_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination
 
-# IPv4 only (исходящий и входящий)
+# IPv4 only
 inet_protocols = ipv4
 smtp_address_preference = ipv4
 
-# Доставка в Dovecot через LMTP; список ящиков проверит Dovecot
+# Виртуальные домены/ящики: доставка в Dovecot через LMTP
 virtual_mailbox_domains = ${DOMAIN}
 virtual_transport = lmtp:unix:private/dovecot-lmtp
+virtual_mailbox_maps = hash:/etc/postfix/virtual_mailbox_maps
 
 # SASL через Dovecot (AUTH на submission/SMTPS)
 smtpd_sasl_type = dovecot
@@ -52,15 +54,13 @@ smtpd_sasl_security_options = noanonymous
 smtpd_sasl_local_domain =
 broken_sasl_auth_clients = yes
 
-# TLS политика
+# TLS-политика
 smtpd_tls_auth_only = yes
 smtpd_tls_security_level = may
-smtp_tls_security_level = may
+smtp_tls_security_level  = may
 smtpd_tls_protocols = !SSLv2, !SSLv3
-smtp_tls_protocols = !SSLv2, !SSLv3
+smtp_tls_protocols  = !SSLv2, !SSLv3
 tls_preempt_cipherlist = yes
-
-# Если есть сертификат — укажем глобально, иначе пропустим (submission/SMTPS включим только при наличии LE)
 EOF
 
   if [[ -r "${LE_FULL}" && -r "${LE_KEY}" ]]; then
@@ -70,28 +70,51 @@ smtpd_tls_key_file  = ${LE_KEY}
 EOF
   fi
 
-  # Доп. гигиена
   cat >> "$tmp" <<'EOF'
-disable_vrfy_command = yes
+# Приёмная гигиена
+smtpd_helo_required = yes
 strict_rfc821_envelopes = yes
+smtpd_sender_restrictions =
+    reject_non_fqdn_sender,
+    reject_unknown_sender_domain
+smtpd_recipient_restrictions =
+    reject_non_fqdn_recipient,
+    reject_unknown_recipient_domain,
+    permit_mynetworks,
+    permit_sasl_authenticated,
+    reject_unauth_destination
+
+disable_vrfy_command = yes
 smtputf8_enable = no
 EOF
 
-  # Атомарная установка конфига
   run_cmd "install -m 0644 '${tmp}' '${PF_MAIN}'"
+  rm -f "$tmp"
+}
+
+postfix::virtual_maps_from_users() {
+  postfix::paths
+  local tmp; tmp="$(mktemp)"
+  local count i login
+  count="$(yq -r '(.users // []) | length' "${VARS_FILE}")"
+  for (( i=0; i<count; i++ )); do
+    login="$(yq -r ".users[${i}].login" "${VARS_FILE}")"
+    [[ "$login" =~ @ ]] || continue
+    printf '%s OK\n' "$login" >>"$tmp"
+  done
+  run_cmd "install -m 0644 '${tmp}' '${VMAP_PATH}'"
+  run_cmd "postmap hash:'${VMAP_PATH}'"
   rm -f "$tmp"
 }
 
 postfix::enable_tls_services() {
   postfix::paths
-  # Включаем 587/465 только если есть сертификат
   if [[ ! ( -r "${LE_FULL}" && -r "${LE_KEY}" ) ]]; then
     log_warn "Postfix: LE-сертификат отсутствует — пропускаю активацию 587/465"
     return 0
   fi
 
   log_info "Postfix: настраиваю сервисы submission (587) и smtps (465)"
-  # Создаём/обновляем сервисы через postconf -M / -P (идемпотентно, без правки master.cf руками)
   run_cmd "postconf -M submission/inet='submission inet n - y - - smtpd'"
   run_cmd "postconf -P 'submission/inet/smtpd_tls_security_level=encrypt'"
   run_cmd "postconf -P 'submission/inet/smtpd_sasl_auth_enable=yes'"
@@ -113,7 +136,6 @@ postfix::reload_enable() {
   run_cmd "systemctl reload postfix || systemctl restart postfix"
 }
 
-# Хук для модуля SSL (можно вызвать после получения сертификата)
 postfix::ensure_tls_after_le() {
   postfix::enable_tls_services
   postfix::reload_enable
@@ -121,5 +143,6 @@ postfix::ensure_tls_after_le() {
 
 # --- ENTRYPOINT ---
 postfix::write_main_cf
+postfix::virtual_maps_from_users
 postfix::enable_tls_services
 postfix::reload_enable

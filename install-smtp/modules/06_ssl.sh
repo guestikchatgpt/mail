@@ -2,6 +2,9 @@
 # Требует: VARS_FILE, DOMAIN, HOSTNAME, DRY_RUN; функции: run_cmd, log_*, die, require_cmd
 # shellcheck shell=bash
 
+set -Eeuo pipefail
+IFS=$'\n\t'
+
 ssl::le_paths() {
   LE_DIR="/etc/letsencrypt/live/${HOSTNAME}"
   LE_FULLCHAIN="${LE_DIR}/fullchain.pem"
@@ -9,7 +12,6 @@ ssl::le_paths() {
 }
 
 ssl::get_acme_email() {
-  # Один вызов yq с дефолтом — без лишней логики
   local email
   email="$(yq -r ".acme_email // \"postmaster@${DOMAIN}\"" "${VARS_FILE}")"
   if ! grep -qiE '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$' <<<"$email"; then
@@ -20,9 +22,9 @@ ssl::get_acme_email() {
 
 ssl::port80_in_use() {
   if command -v ss >/dev/null 2>&1; then
-    ss -ltnp | awk '($4 ~ /:80$/)' | grep -q . && return 0 || return 1
+    ss -ltnp | awk '($4 ~ /:80$/)' | grep -q .
   elif command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:80 -sTCP:LISTEN | grep -q . && return 0 || return 1
+    lsof -nP -iTCP:80 -sTCP:LISTEN | grep -q .
   else
     log_warn "Не найдено ss/lsof — пропускаю проверку занятности порта 80"
     return 1
@@ -32,6 +34,13 @@ ssl::port80_in_use() {
 ssl::cert_valid_until_iso8601() {
   local pem="$1"; [[ -r "$pem" ]] || return 1
   local raw; raw="$(openssl x509 -enddate -noout -in "$pem" 2>/dev/null | sed -n 's/^notAfter=//p')" || return 1
+  [[ -n "$raw" ]] || return 1
+  date -u -d "$raw" +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+ssl::cert_valid_from_iso8601() {
+  local pem="$1"; [[ -r "$pem" ]] || return 1
+  local raw; raw="$(openssl x509 -startdate -noout -in "$pem" 2>/dev/null | sed -n 's/^notBefore=//p')" || return 1
   [[ -n "$raw" ]] || return 1
   date -u -d "$raw" +"%Y-%m-%dT%H:%M:%SZ"
 }
@@ -61,7 +70,6 @@ ssl::request_le_cert() {
   fi
 
   log_info "LE: запрашиваю сертификат для ${HOSTNAME}"
-  # Безопасно экранируем значения
   local em_q host_q
   em_q="$(printf '%q' "$email")"
   host_q="$(printf '%q' "$HOSTNAME")"
@@ -71,7 +79,6 @@ ssl::request_le_cert() {
     --non-interactive --agree-tos --no-eff-email \
     -m ${em_q} -d ${host_q}"
 
-  # Активируем системный таймер на всякий
   run_cmd "systemctl enable --now certbot.timer" || true
 
   days_left="$(ssl::cert_valid_days_left "${LE_FULLCHAIN}")"
@@ -86,7 +93,6 @@ ssl::setup_renew_hooks() {
   local hook="${hook_dir}/99-reload-mail-services.sh"
 
   log_info "LE: настраиваю deploy-hook для перезагрузки Postfix/Dovecot"
-  # Пишем контент во временный файл, затем атомарно кладём на место
   local tmp_hook; tmp_hook="$(mktemp)"
   cat > "$tmp_hook" <<'EOF'
 #!/usr/bin/env bash
@@ -102,13 +108,6 @@ EOF
   run_cmd "install -d -m 0755 '${hook_dir}'"
   run_cmd "install -m 0755 '${tmp_hook}' '${hook}'"
   rm -f "$tmp_hook"
-}
-
-ssl::cert_valid_from_iso8601() {
-  local pem="$1"; [[ -r "$pem" ]] || return 1
-  local raw; raw="$(openssl x509 -startdate -noout -in "$pem" 2>/dev/null | sed -n 's/^notBefore=//p')" || return 1
-  [[ -n "$raw" ]] || return 1
-  date -u -d "$raw" +"%Y-%m-%dT%H:%M:%SZ"
 }
 
 ssl::export_manifest_vars() {
@@ -129,12 +128,12 @@ ssl::export_manifest_vars() {
 ssl::request_le_cert
 ssl::setup_renew_hooks
 ssl::export_manifest_vars
-# Пост-хуки для сервисов, если функции определены
+
+# Пост-хуки
 if declare -F postfix::ensure_tls_after_le >/dev/null 2>&1; then
   log_info "LE: пост-хук — включаю TLS-сервисы Postfix (587/465)"
   postfix::ensure_tls_after_le
 fi
-
 if declare -F dovecot::ensure_after_le >/dev/null 2>&1; then
   log_info "LE: пост-хук — финализирую Dovecot (IMAPS/POPS/LMTP)"
   dovecot::ensure_after_le

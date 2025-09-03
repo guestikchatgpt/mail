@@ -1,25 +1,19 @@
 # modules/100_report.sh — финальный человекочитаемый отчёт (Markdown)
-# Источник данных: ТОЛЬКО переменные окружения, выставленные предыдущими модулями.
-# Никаких чтений vars.yaml/manifest.json и никаких внешних команд.
+# Источник данных: только переменные окружения, выставленные предыдущими модулями.
 # Пишет /var/local/msa/report.md (кроме --dry-run). stdout не трогаем.
 # Требует: log_info, log_warn, run_cmd, переменные: DOMAIN, HOSTNAME, IPV4, LE_DOMAIN, LE_VALID_FROM, LE_VALID_UNTIL,
 #          DKIM_SELECTOR, DKIM_TXT, PORT_25, PORT_465, PORT_587, PORT_993, PORT_995,
 #          HC_SMTPS_465, HC_SMTP_587_STARTTLS, HC_IMAPS_993, HC_DKIM_SIGN, HC_HELO_MATCHES_PTR
-
 # shellcheck shell=bash
 
+set -Eeuo pipefail
+IFS=$'\n\t'
+
 report::_now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-
-# Безопасные геттеры (без внешних вызовов)
 report::_val() { local v="$1" d="$2"; [[ -n "$v" ]] && printf '%s' "$v" || printf '%s' "$d"; }
-
-# Разбить длинный DKIM TXT на куски по 255 символов
 report::_chunk_255() {
   local s="$1" len=${#1} i=0 out=""
-  while (( i < len )); do
-    out+="\"${s:i:255}\" "
-    (( i += 255 ))
-  done
+  while (( i < len )); do out+="\"${s:i:255}\" "; (( i+=255 )); done
   printf '%s' "${out% }"
 }
 
@@ -38,11 +32,7 @@ report::render() {
   local dkim_sel dkim_txt dkim_chunks
   dkim_sel="$(report::_val "${DKIM_SELECTOR:-}" "s1")"
   dkim_txt="$(report::_val "${DKIM_TXT:-}" "")"
-  if [[ -n "$dkim_txt" ]]; then
-    dkim_chunks="$(report::_chunk_255 "$dkim_txt")"
-  else
-    dkim_chunks=""
-  fi
+  [[ -n "$dkim_txt" ]] && dkim_chunks="$(report::_chunk_255 "$dkim_txt")" || dkim_chunks=""
 
   local p25 p465 p587 p993 p995
   p25="$(report::_val "${PORT_25:-}"  "open")"
@@ -58,7 +48,6 @@ report::render() {
   hcdkim="$(report::_val "${HC_DKIM_SIGN:-}" "unknown")"
   hchelo="$(report::_val "${HC_HELO_MATCHES_PTR:-}" "unknown")"
 
-  # Производные DNS-значения из известных переменных (без сторонних вызовов)
   local dns_a dns_mx dns_spf dns_dmarc
   dns_a="${ipv4}"
   dns_mx="${hostname}"
@@ -66,7 +55,6 @@ report::render() {
   dns_dmarc="v=DMARC1; p=none; rua=mailto:dmarc@${domain}"
 
   local tmp; tmp="$(mktemp)"
-
   {
     printf "# Mail instance report\n\n"
     printf "- Generated at: \`%s\` (UTC)\n" "$now"

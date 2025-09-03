@@ -2,6 +2,9 @@
 # Требует: DOMAIN, HOSTNAME, VARS_FILE, DRY_RUN; функции: run_cmd, log_*, die, require_cmd
 # shellcheck shell=bash
 
+set -Eeuo pipefail
+IFS=$'\n\t'
+
 dovecot::paths() {
   DC_CONF_DIR="/etc/dovecot"
   DC_CONF_DROPIN="${DC_CONF_DIR}/conf.d/90-msa.conf"
@@ -17,19 +20,16 @@ dovecot::require_bins() {
   require_cmd openssl
 }
 
-# Генерим passdb из vars.yaml (SHA512-CRYPT), идемпотентно
 dovecot::write_passdb() {
   dovecot::paths
   run_cmd "install -d -m 0750 '${DC_PASSDB_DIR}'"
   local tmp; tmp="$(mktemp)"
-  # Заполняем временный файл
   local count i login password hash
   count="$(yq -r '(.users // []) | length' "${VARS_FILE}")"
   for (( i=0; i<count; i++ )); do
     login="$(yq -r ".users[${i}].login" "${VARS_FILE}")"
     password="$(yq -r ".users[${i}].password" "${VARS_FILE}")"
     [[ -n "$login" && -n "$password" ]] || continue
-    # doveadm pw безопасно выдаёт хэш; пароль не логируем
     hash="$(doveadm pw -s SHA512-CRYPT -p "${password}")"
     printf '%s:%s\n' "$login" "$hash" >> "$tmp"
   done
@@ -37,7 +37,6 @@ dovecot::write_passdb() {
   rm -f "$tmp"
 }
 
-# Создаём каталоги Maildir для пользователей (опционально, чтобы всё было готово)
 dovecot::ensure_maildirs() {
   dovecot::paths
   local count i login u_local u_domain mdir
@@ -48,12 +47,10 @@ dovecot::ensure_maildirs() {
     u_local="${login%@*}"
     u_domain="${login#*@}"
     mdir="${VMAIL_HOME}/${u_domain}/${u_local}/Maildir"
-    run_cmd "install -d -m 0700 '${mdir}'"
-    run_cmd "chown -R vmail:vmail '${VMAIL_HOME}/${u_domain}/${u_local}'"
+    run_cmd "install -d -m 0700 -o vmail -g vmail '${mdir}'"
   done
 }
 
-# Пишем drop-in конфиг. TLS секцию добавляем только при наличии LE.
 dovecot::write_conf() {
   dovecot::paths
   local tmp; tmp="$(mktemp)"
@@ -65,6 +62,10 @@ listen = *
 
 # Хранилище
 mail_location = maildir:/var/vmail/%d/%n/Maildir
+# Нижние границы, фактические uid/gid задаются userdb=static
+first_valid_uid = 100
+first_valid_gid = 100
+
 namespace inbox {
   inbox = yes
 }
@@ -74,7 +75,6 @@ auth_mechanisms = plain login
 disable_plaintext_auth = yes
 passdb {
   driver = passwd-file
-  # username_format гарантирует сравнение по полному адресу
   args = scheme=SHA512-CRYPT username_format=%u /etc/dovecot/passdb/users
 }
 userdb {
@@ -98,7 +98,6 @@ service lmtp {
   }
 }
 EOF
-    # TLS блок — только если есть LE
     if [[ -r "${LE_FULL}" && -r "${LE_KEY}" ]]; then
       cat <<EOF
 # TLS
@@ -121,13 +120,11 @@ EOF
 }
 
 dovecot::reload_enable() {
-  run_cmd "dovecot -n"           # проверка синтаксиса
+  run_cmd "dovecot -n"
   run_cmd "systemctl enable --now dovecot"
   run_cmd "systemctl reload dovecot || systemctl restart dovecot"
 }
 
-# Хук, который вызывает 06_ssl.sh после выпуска LE:
-# дописывает TLS в конфиг (если не было), перезагружает сервис.
 dovecot::ensure_after_le() {
   dovecot::paths
   if [[ -r "${LE_FULL}" && -r "${LE_KEY}" ]]; then
@@ -144,7 +141,6 @@ dovecot::require_bins
 dovecot::write_passdb
 dovecot::ensure_maildirs
 dovecot::write_conf
-# Включим сервис только если TLS уже готов; иначе дождёмся пост-хука из SSL
 if [[ -r "/etc/letsencrypt/live/${HOSTNAME}/fullchain.pem" && -r "/etc/letsencrypt/live/${HOSTNAME}/privkey.pem" ]]; then
   dovecot::reload_enable
 else
