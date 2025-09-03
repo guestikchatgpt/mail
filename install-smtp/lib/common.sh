@@ -5,9 +5,9 @@ IFS=$'\n\t'
 
 _ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
-log_info()  { printf '[%s] [INFO]  %s\n' "$(_ts)" "$*" >&2; }
-log_warn()  { printf '[%s] [WARN]  %s\n' "$(_ts)" "$*" >&2; }
-log_error() { printf '[%s] [ERROR] %s\n' "$(_ts)" "$*" >&2; }
+log_info()  { printf '[%s] [INFO]  %s\n'  "$(_ts)" "$*" >&2; }
+log_warn()  { printf '[%s] [WARN]  %s\n'  "$(_ts)" "$*" >&2; }
+log_error() { printf '[%s] [ERROR] %s\n'  "$(_ts)" "$*" >&2; }
 
 die() {
   local code=1
@@ -16,19 +16,23 @@ die() {
   exit "${code}"
 }
 
-# Выполнить команду с уважением к DRY_RUN (ожидает глобальную DRY_RUN)
-# Использование:
-#   run_cmd "apt-get update"
-#   run_cmd "DEBIAN_FRONTEND=noninteractive apt-get -y install postfix"
+# Безопасное выполнение команд с уважением к DRY_RUN.
+# - Если вызвано с несколькими аргументами: исполняем напрямую (без bash -c).
+# - Если передана одна строка: совместимость со старым кодом через bash -c.
 run_cmd() {
-  local cmd="$*"
   if [[ "${DRY_RUN:-false}" == "true" ]]; then
-    log_info "DRY-RUN: $cmd"
+    log_info "DRY-RUN: $*"
     return 0
   fi
-  log_info "RUN: $cmd"
-  # shellcheck disable=SC2086
-  /bin/bash -o pipefail -c "$cmd"
+
+  if [[ $# -gt 1 ]]; then
+    log_info "RUN: $*"
+    "$@"
+  else
+    local cmd="$*"
+    log_info "RUN: $cmd"
+    /bin/bash -o pipefail -c "$cmd"
+  fi
 }
 
 ensure_root_or_die() {

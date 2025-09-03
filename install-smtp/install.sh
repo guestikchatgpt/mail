@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- раннее логирование во встроенный файл + на экран ---
+LOG_DIR="/var/log/msa"
+mkdir -p "${LOG_DIR}"
+export LOG_FILE="${LOG_DIR}/install-$(date -u +%Y%m%d-%H%M%S).log"
+# Дублируем stdout/stderr и в файл, и на экран
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
 # --- bootstrap logger used до загрузки общих хелперов ---
 if [[ "$(type -t log 2>/dev/null)" != "function" ]]; then
   log(){ printf '[%(%FT%TZ)T] [%s] %s\n' -1 "${1:-INFO}" "${*:2}"; }
@@ -16,10 +23,8 @@ MODULES_DIR="${SCRIPT_DIR}/modules"
 LIB_DIR="${SCRIPT_DIR}/lib"
 
 # --- libs ---------------------------------------------------------------------
-# Ожидаем lib/common.sh с функциями: log_info/log_warn/log_error, die, run_cmd, require_cmd
-# (они уже есть в проекте)
 # shellcheck disable=SC1090
-source "${LIB_DIR}/common.sh"
+source "${LIB_DIR}/common.sh"   # die, run_cmd, require_cmd, log_*
 
 # --- globals ------------------------------------------------------------------
 VARS_FILE=""
@@ -29,7 +34,6 @@ DRY_RUN=false
 # --- utils --------------------------------------------------------------------
 require_yq_v4() {
   require_cmd yq
-  # Пример вывода: "yq (https://github.com/mikefarah/yq/) version v4.47.1"
   local out major
   out="$(yq -V 2>&1 || true)"
   major="$(grep -oE '[0-9]+' <<<"$out" | head -n1 || true)"
@@ -44,7 +48,7 @@ ensure_root_if_needed() {
   fi
 }
 
-# ===== ensure yq v4+ =====
+# ===== ensure yq v4+ (автоустановка при необходимости) =====
 ensure_yq_v4() {
   _log(){ printf '[%(%FT%TZ)T] [%s] %s\n' -1 "${1:-INFO}" "${*:2}"; }
 
@@ -61,7 +65,6 @@ ensure_yq_v4() {
     _log INFO "yq не найден — ставлю свежий v4"
   fi
 
-  # нужен wget или curl
   if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
     _log INFO "ставлю wget для загрузки yq…"
     apt-get update -y >/dev/null 2>&1 || true
@@ -90,22 +93,29 @@ usage() {
   printf '%s\n' \
 "usage: $0 --vars vars.yaml [--dry-run] [--healthcheck] [--print-dns]
   --vars FILE      путь к vars.yaml (обязателен для install/print-dns)
-  --dry-run        не выполнять изменяющие команды (если реализовано в модулях)
-  --healthcheck    загрузить и запустить только 99_healthcheck.sh
-  --print-dns      вывести DNS-записи, которые нужно добавить вручную
+  --dry-run        не выполнять изменяющие команды
+  --healthcheck    запустить только 99_healthcheck.sh
+  --print-dns      вывести DNS-записи (A/MX/SPF/DKIM/DMARC)
   -h, --help       показать эту справку"
 }
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --vars)
+      --vars|-f)
         [[ $# -ge 2 ]] || die "--vars требует путь к файлу"
         VARS_FILE="$2"; shift 2;;
       --dry-run)
         DRY_RUN=true; shift;;
-      --healthcheck)
-        MODE="healthcheck"; shift;;
+      --healthcheck|-m)
+        # Совместимость: -m healthcheck
+        if [[ "$1" == "-m" ]]; then
+          [[ $# -ge 2 ]] || die "-m требует значение (install|healthcheck|print-dns)"
+          MODE="$2"; shift 2
+        else
+          MODE="healthcheck"; shift
+        fi
+        ;;
       --print-dns)
         MODE="print-dns"; shift;;
       -h|--help)
@@ -123,19 +133,25 @@ load_and_validate_vars() {
   require_yq_v4
   [[ -r "${VARS_FILE}" ]] || die "vars.yaml не найден: ${VARS_FILE}"
 
-  export DOMAIN
-  export HOSTNAME
-  export IPV4
-  export ACCEPT_INBOUND
-  export ACME_EMAIL
-  export DKIM_SELECTOR
+  export DOMAIN HOSTNAME IPV4 ACCEPT_INBOUND ACME_EMAIL DKIM_SELECTOR
 
   DOMAIN="$(yq -r '.domain // ""' "${VARS_FILE}")"
   HOSTNAME="$(yq -r ".hostname // (\"mail.\" + .domain)" "${VARS_FILE}")"
   IPV4="$(yq -r '.ipv4 // ""' "${VARS_FILE}")"
-  ACCEPT_INBOUND="$(yq -r '.accept_inbound // true' "${VARS_FILE}")"
   ACME_EMAIL="$(yq -r ".acme_email // (\"postmaster@\" + .domain)" "${VARS_FILE}")"
   DKIM_SELECTOR="$(yq -r ".dkim_selector // \"s1\"" "${VARS_FILE}")"
+
+  # accept_inbound: явный флаг имеет приоритет; иначе — по mode (default full_mail)
+  if yq -e '.accept_inbound' "${VARS_FILE}" >/dev/null 2>&1; then
+    ACCEPT_INBOUND="$(yq -r '.accept_inbound' "${VARS_FILE}")"
+  else
+    MODE_MAIL="$(yq -r '.mode // "full_mail"' "${VARS_FILE}")"
+    if [[ "${MODE_MAIL}" == "outbound_only" ]]; then
+      ACCEPT_INBOUND="false"
+    else
+      ACCEPT_INBOUND="true"
+    fi
+  fi
 
   local users_count
   users_count="$(yq -r '.users // [] | length' "${VARS_FILE}")"
@@ -149,7 +165,7 @@ load_and_validate_vars() {
     die "Неверный формат IPv4: ${IPV4}"
   fi
 
-  log_info "vars.yaml ок: domain=${DOMAIN}, hostname=${HOSTNAME}, ipv4=${IPV4}, users=${users_count}, mode=${MODE}, dry_run=${DRY_RUN}"
+  log_info "vars.yaml ок: domain=${DOMAIN}, hostname=${HOSTNAME}, ipv4=${IPV4}, users=${users_count}, mode=${MODE}, accept_inbound=${ACCEPT_INBOUND}, dry_run=${DRY_RUN}"
 }
 
 # --- module loader ------------------------------------------------------------
@@ -170,7 +186,7 @@ source_module_healthcheck_only() {
   source "${hc}"
 }
 
-# --- manifest builder (встроенный фолбэк) -------------------------------------
+# --- manifest builder (встроенный) --------------------------------------------
 json_escape() {
   local s="${1:-}"
   s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
@@ -221,11 +237,16 @@ emit_manifest() {
   auth_json="["
   for i in "${!logins[@]}"; do
     [[ $i -gt 0 ]] && auth_json+=","
-    auth_json+="\"$(json_escape "${logins[$i]}@${DOMAIN}")\""
+    # нормализуем как user@DOMAIN
+    if [[ "${logins[$i]}" == *"@"* ]]; then
+      auth_json+="\"$(json_escape "${logins[$i]}")\""
+    else
+      auth_json+="\"$(json_escape "${logins[$i]}@${DOMAIN}")\""
+    fi
   done
   auth_json+="]"
 
-  # healthcheck (HC_*)
+  # healthcheck (HC_* из env)
   hc_json="{"
   first=true
   while IFS='=' read -r k v; do
@@ -254,6 +275,7 @@ emit_manifest() {
   log_info "manifest.json записан в /var/local/msa/manifest.json"
   printf '%s\n' "${manifest}"
 }
+# (блок emit_manifest основан на твоём текущем инсталлере). :contentReference[oaicite:2]{index=2}
 
 # --- extra modes --------------------------------------------------------------
 run_print_dns() {
@@ -266,7 +288,7 @@ run_print_dns() {
   if [[ -n "${DKIM_DNS_TXT:-}" ]]; then
     echo "TXT   ${dkim_selector}._domainkey.${DOMAIN}.  ${DKIM_DNS_TXT}"
   else
-    echo "TXT   ${dkim_selector}._domainkey.${DOMAIN}.  (появится после генерации ключа)"
+    echo "TXT   ${dkim_selector}._domainkey.${DOMAIN}.  (после генерации ключа)"
   fi
   echo "TXT   _dmarc.${DOMAIN}.  ${DMARC_TXT:-v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}}"
   echo

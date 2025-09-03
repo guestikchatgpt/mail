@@ -17,16 +17,16 @@ SoftwareHeader true
 PidFile /run/opendmarc/opendmarc.pid
 RejectFailures false
 EOF
-  run_cmd "install -m 0644 '$tmp' '$cfg'"; rm -f "$tmp"
+  run_cmd install -m 0644 "$tmp" "$cfg"; rm -f "$tmp"
 }
 
 opendmarc::prepare_paths() {
-  run_cmd "install -d -m 0755 -o opendmarc -g opendmarc /run/opendmarc"
-  run_cmd "install -d -m 0750 -o opendmarc -g postfix /var/spool/postfix/opendmarc"
+  run_cmd install -d -m 0755 -o opendmarc -g opendmarc /run/opendmarc
+  run_cmd install -d -m 0750 -o opendmarc -g postfix /var/spool/postfix/opendmarc
 }
 
 opendmarc::systemd_override() {
-  run_cmd "install -d -m 0755 /etc/systemd/system/opendmarc.service.d"
+  run_cmd install -d -m 0755 /etc/systemd/system/opendmarc.service.d
   local ovr="/etc/systemd/system/opendmarc.service.d/override.conf" tmp; tmp="$(mktemp)"
   cat >"$tmp" <<'EOF'
 [Service]
@@ -37,26 +37,24 @@ Group=opendmarc
 ExecStart=
 ExecStart=/usr/sbin/opendmarc -c /etc/opendmarc.conf -l
 EOF
-  run_cmd "install -m 0644 '$tmp' '$ovr'"; rm -f "$tmp"
-  run_cmd "systemctl daemon-reload"
+  run_cmd install -m 0644 "$tmp" "$ovr"; rm -f "$tmp"
+  run_cmd systemctl daemon-reload
 }
 
 opendmarc::wire_postfix() {
   local want="unix:/var/spool/postfix/opendmarc/opendmarc.sock"
   local cur
   cur="$(postconf -h smtpd_milters || true)"
-  [[ "$cur" == *"/opendmarc/opendmarc.sock"* ]] || \
-    run_cmd "postconf -e 'smtpd_milters=${cur:+$cur,}$want'"
+  [[ "$cur" == *"/opendmarc/opendmarc.sock"* ]] || run_cmd postconf -e "smtpd_milters=${cur:+$cur,}$want"
   cur="$(postconf -h non_smtpd_milters || true)"
-  [[ "$cur" == *"/opendmarc/opendmarc.sock"* ]] || \
-    run_cmd "postconf -e 'non_smtpd_milters=${cur:+$cur,}$want'"
-  run_cmd "postconf -e 'milter_default_action=accept'"
-  run_cmd "postconf -e 'milter_protocol=6'"
+  [[ "$cur" == *"/opendmarc/opendmarc.sock"* ]] || run_cmd postconf -e "non_smtpd_milters=${cur:+$cur,}$want"
+  run_cmd postconf -e "milter_default_action=accept"
+  run_cmd postconf -e "milter_protocol=6"
 }
 
 opendmarc::restart() {
-  run_cmd "systemctl enable --now opendmarc"
-  run_cmd "systemctl restart opendmarc"
+  run_cmd systemctl enable --now opendmarc
+  run_cmd systemctl restart opendmarc
 }
 
 # ENTRYPOINT
