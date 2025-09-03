@@ -1,0 +1,20 @@
+# vars.yaml.example — единый источник правды для инсталлятора
+# Скопируй как vars.yaml и правь значения под свой инстанс.
+
+# Базовые параметры
+domain: example.ru               # Корневой домен
+hostname: mail.example.ru        # FQDN почтового хоста (HELO/EHLO и CN сертификата)
+ipv4: 203.0.113.10               # Публичный IPv4 для этого инстанса
+accept_inbound: true             # Приём входящей почты на 25/tcp (true/false)
+
+# Пользователи (минимум один). Пароли — в кавычках.
+users:
+  - login: user@example.ru
+    password: "S3cret!"
+  # - login: second@example.ru
+  #   password: "AnotherS3cret!"
+
+# Опционально: токен для автоматизации DNS через API Beget
+beget_token: ""                  # Или оставь пустым, если DNS правишь вручную
+
+# В будущем сюда могут добавиться неймселекторы DKIM, параметры TLS и т.д.
