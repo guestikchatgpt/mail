@@ -1,20 +1,26 @@
-# vars.yaml.example — единый источник правды для инсталлятора
-# Скопируй как vars.yaml и правь значения под свой инстанс.
+# vars.yaml.example — единственный источник параметров для инсталлятора
 
-# Базовые параметры
-domain: example.ru               # Корневой домен
-hostname: mail.example.ru        # FQDN почтового хоста (HELO/EHLO и CN сертификата)
-ipv4: 203.0.113.10               # Публичный IPv4 для этого инстанса
-accept_inbound: true             # Приём входящей почты на 25/tcp (true/false)
+# Базовые
+domain: example.ru
+hostname: mail.example.ru        # если пусто — подставится mail.<domain>
+ipv4: 203.0.113.10
 
-# Пользователи (минимум один). Пароли — в кавычках.
+# Приём входящей почты на 25/tcp
+# true  — открываем 25 в фаерволе и включаем smtp/inet (порт 25) в Postfix
+# false — 25 не открываем и отключаем smtp/inet (оставляем только submission/smtps)
+accept_inbound: true
+
+# Пользователи (виртуальные ящики)
 users:
   - login: user@example.ru
     password: "S3cret!"
-  # - login: second@example.ru
-  #   password: "AnotherS3cret!"
 
-# Опционально: токен для автоматизации DNS через API Beget
-beget_token: ""                  # Или оставь пустым, если DNS правишь вручную
+# Let's Encrypt (можно переопределить адрес для регистрации)
+acme_email: postmaster@example.ru
 
-# В будущем сюда могут добавиться неймселекторы DKIM, параметры TLS и т.д.
+# DKIM (селектор ключа; по умолчанию s1)
+dkim_selector: s1
+
+# Опционально: токен DNS-провайдера для автоматизации публикации записей
+# (Beget/Cloudflare и т.п.; модуль 09_dns_update.sh)
+beget_token: ""
