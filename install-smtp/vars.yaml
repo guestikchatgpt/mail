@@ -1,0 +1,26 @@
+# vars.yaml.example — единственный источник параметров для инсталлятора
+
+# Базовые
+domain: example.ru
+hostname: mail.example.ru        # если пусто — подставится mail.<domain>
+ipv4: 1.1.1.1
+
+# Приём входящей почты на 25/tcp
+# true  — открываем 25 в фаерволе и включаем smtp/inet (порт 25) в Postfix
+# false — 25 не открываем и отключаем smtp/inet (оставляем только submission/smtps)
+accept_inbound: true
+
+# Пользователи (виртуальные ящики)
+users:
+  - login: info@exapmle.ru
+    password: "S3cret!"
+
+# Let's Encrypt (можно переопределить адрес для регистрации)
+acme_email: info@example.ru
+
+# DKIM (селектор ключа; по умолчанию s1)
+dkim_selector: s1
+
+# Опционально: токен DNS-провайдера для автоматизации публикации записей
+# (Beget/Cloudflare и т.п.; модуль 09_dns_update.sh)
+beget_token: ""

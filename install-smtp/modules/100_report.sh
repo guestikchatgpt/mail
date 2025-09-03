@@ -1,113 +1,227 @@
-# modules/100_report.sh — финальный человекочитаемый отчёт (Markdown)
-# Источник данных: только переменные окружения, выставленные предыдущими модулями.
-# Пишет /var/local/msa/report.md (кроме --dry-run). stdout не трогаем.
-# Требует: log_info, log_warn, run_cmd, переменные: DOMAIN, HOSTNAME, IPV4, LE_DOMAIN, LE_VALID_FROM, LE_VALID_UNTIL,
-#          DKIM_SELECTOR, DKIM_TXT, PORT_25, PORT_465, PORT_587, PORT_993, PORT_995,
-#          HC_SMTPS_465, HC_SMTP_587_STARTTLS, HC_IMAPS_993, HC_DKIM_SIGN, HC_HELO_MATCHES_PTR
-# shellcheck shell=bash
-
+#!/usr/bin/env bash
 set -Eeuo pipefail
-IFS=$'\n\t'
 
-report::_now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-report::_val() { local v="$1" d="$2"; [[ -n "$v" ]] && printf '%s' "$v" || printf '%s' "$d"; }
-report::_chunk_255() {
-  local s="$1" len=${#1} i=0 out=""
-  while (( i < len )); do out+="\"${s:i:255}\" "; (( i+=255 )); done
-  printf '%s' "${out% }"
-}
+# ---------- мини-logger / run (на случай автономного запуска) ----------
+if [[ "$(type -t log 2>/dev/null)" != "function" ]]; then
+  log(){ printf '[%(%FT%TZ)T] [%s] %s\n' -1 "${1:-INFO}" "${*:2}"; }
+fi
+if [[ "$(type -t run 2>/dev/null)" != "function" ]]; then
+  run(){ log INFO "RUN: $*"; "$@"; }
+fi
 
-report::render() {
-  local now hostname domain ipv4
-  now="$(report::_now_iso)"
-  hostname="$(report::_val "${HOSTNAME:-}" "n/a")"
-  domain="$(report::_val "${DOMAIN:-}" "n/a")"
-  ipv4="$(report::_val "${IPV4:-}" "n/a")"
+export LC_ALL=C
 
-  local le_dom le_from le_until
-  le_dom="$(report::_val "${LE_DOMAIN:-}" "${hostname}")"
-  le_from="$(report::_val "${LE_VALID_FROM:-}" "n/a")"
-  le_until="$(report::_val "${LE_VALID_UNTIL:-}" "n/a")"
+# ---------- входные переменные ----------
+VARS_FILE="${VARS_FILE:-${1:-vars.yaml}}"
 
-  local dkim_sel dkim_txt dkim_chunks
-  dkim_sel="$(report::_val "${DKIM_SELECTOR:-}" "s1")"
-  dkim_txt="$(report::_val "${DKIM_TXT:-}" "")"
-  [[ -n "$dkim_txt" ]] && dkim_chunks="$(report::_chunk_255 "$dkim_txt")" || dkim_chunks=""
+# Требуем yq v4+ (если нет — просто попробуем то, что есть; ошибки не срывают отчёт)
+if ! command -v yq >/dev/null 2>&1; then
+  log WARN "yq не найден — пытаюсь скачать бинарь в /usr/local/bin/yq"
+  run bash -c 'curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && chmod +x /usr/local/bin/yq' || true
+fi
 
-  local p25 p465 p587 p993 p995
-  p25="$(report::_val "${PORT_25:-}"  "open")"
-  p465="$(report::_val "${PORT_465:-}" "open")"
-  p587="$(report::_val "${PORT_587:-}" "open")"
-  p993="$(report::_val "${PORT_993:-}" "open")"
-  p995="$(report::_val "${PORT_995:-}" "open")"
+# Читаем базовые поля
+DOMAIN="$(yq -r '.domain // ""' "$VARS_FILE" 2>/dev/null || echo '')"
+HOSTNAME="$(yq -r '.hostname // ( .domain | select(.!=null) | "mail."+.)' "$VARS_FILE" 2>/dev/null || echo '')"
+IPV4="$(yq -r '.ipv4 // ""' "$VARS_FILE" 2>/dev/null || echo '')"
+SELECTOR="$(yq -r '.dkim_selector // "s1"' "$VARS_FILE" 2>/dev/null || echo 's1')"
 
-  local hc465 hc587 hc993 hcdkim hchelo
-  hc465="$(report::_val "${HC_SMTPS_465:-}" "unknown")"
-  hc587="$(report::_val "${HC_SMTP_587_STARTTLS:-}" "unknown")"
-  hc993="$(report::_val "${HC_IMAPS_993:-}" "unknown")"
-  hcdkim="$(report::_val "${HC_DKIM_SIGN:-}" "unknown")"
-  hchelo="$(report::_val "${HC_HELO_MATCHES_PTR:-}" "unknown")"
+# Подстрахуемся, если domain не вытянулся
+if [[ -z "$DOMAIN" && -n "$HOSTNAME" ]]; then
+  DOMAIN="${HOSTNAME#*.}"
+fi
 
-  local dns_a dns_mx dns_spf dns_dmarc
-  dns_a="${ipv4}"
-  dns_mx="${hostname}"
-  dns_spf="v=spf1 ip4:${ipv4} a:${hostname} ~all"
-  dns_dmarc="v=DMARC1; p=none; rua=mailto:dmarc@${domain}"
+OUT_DIR="/var/local/msa"
+REPORT_TXT="${OUT_DIR}/report.txt"
+REPORT_MD="${OUT_DIR}/report.md"
 
-  local tmp; tmp="$(mktemp)"
-  {
-    printf "# Mail instance report\n\n"
-    printf "- Generated at: \`%s\` (UTC)\n" "$now"
-    printf "- Hostname: \`%s\`\n" "$hostname"
-    printf "- Domain: \`%s\`\n" "$domain"
-    printf "- IPv4: \`%s\`\n\n" "$ipv4"
+run install -d -m 0755 "$OUT_DIR"
 
-    printf "## TLS certificate\n\n"
-    printf "- Certificate for (LE): \`%s\`\n" "$le_dom"
-    printf "- Valid from: \`%s\`\n" "$le_from"
-    printf "- Valid until: \`%s\`\n\n" "$le_until"
+# ---------- версии ПО ----------
+POSTFIX_VER="$(postconf -h mail_version 2>/dev/null || echo n/a)"
+DOVECOT_VER="$(dovecot --version 2>/dev/null || echo n/a)"
+OPENDKIM_VER="$(opendkim -V 2>&1 | awk 'NR==1{print $3}' 2>/dev/null || echo n/a)"
+OPENDMARC_VER="$(opendmarc -V 2>&1 | awk 'NR==1{print $3}' 2>/dev/null || echo n/a)"
+FAIL2BAN_VER="$(fail2ban-client -V 2>&1 | awk '{print $2; exit}' 2>/dev/null || echo n/a)"
+CERTBOT_VER="$(certbot --version 2>/dev/null | awk '{print $2}' || echo n/a)"
 
-    printf "## Ports (listen) & Health\n\n"
-    printf "| Port | Listen | Health |\n"
-    printf "|------|--------|--------|\n"
-    printf "| 25   | %s | (HELO/PTR: %s) |\n" "$p25" "$hchelo"
-    printf "| 465  | %s | SMTPS: %s |\n" "$p465" "$hc465"
-    printf "| 587  | %s | STARTTLS: %s |\n" "$p587" "$hc587"
-    printf "| 993  | %s | IMAPS: %s |\n" "$p993" "$hc993"
-    printf "| 995  | %s | — |\n\n" "$p995"
-
-    printf "## DNS records (to set/verify)\n\n"
-    printf "- **A**: \`%s\`\n" "$dns_a"
-    printf "- **MX**: \`%s\`\n" "$dns_mx"
-    printf "- **SPF**: \`%s\`\n" "$dns_spf"
-    printf "- **DKIM selector**: \`%s\`\n" "$dkim_sel"
-    if [[ -n "$dkim_txt" ]]; then
-      printf "- **DKIM TXT (single line)**:\n"
-      printf "  \`\`\`\n  %s\n  \`\`\`\n" "$dkim_txt"
-      printf "- **DKIM TXT (chunked ≤255 chars for DNS)**:\n"
-      printf "  \`\`\`\n  %s\n  \`\`\`\n" "$dkim_chunks"
-    else
-      printf "- **DKIM TXT**: _not available yet_\n"
-    fi
-    printf "- **DMARC**: \`%s\`\n\n" "$dns_dmarc"
-
-    printf "## Summary\n"
-    printf "- HELO matches PTR: **%s**\n" "$hchelo"
-    printf "- DKIM test: **%s**\n" "$hcdkim"
-    printf "- TLS: 465=%s, 587/STARTTLS=%s, 993=%s\n" "$hc465" "$hc587" "$hc993"
-  } > "$tmp"
-
-  if [[ "${DRY_RUN:-false}" == "true" ]]; then
-    log_info "DRY-RUN: отчёт не записываю. Путь был бы: /var/local/msa/report.md"
-    rm -f "$tmp"
-    return 0
+# ---------- состояние портов (через ss) ----------
+pstate() {
+  local port="$1"
+  if ss -ltn "( sport = :${port} )" 2>/dev/null | grep -q LISTEN; then
+    echo "open"
+  else
+    echo "closed"
   fi
-
-  run_cmd "install -d -m 0755 /var/local/msa"
-  run_cmd "install -m 0644 '${tmp}' /var/local/msa/report.md"
-  rm -f "$tmp"
-  log_info "Отчёт сохранён: /var/local/msa/report.md"
 }
+PORT25="$(pstate 25)"
+PORT465="$(pstate 465)"
+PORT587="$(pstate 587)"
+PORT993="$(pstate 993)"
+PORT995="$(pstate 995)"
 
-# --- ENTRYPOINT ---
-report::render
+# ---------- TLS сроки ----------
+LE_DIR="/etc/letsencrypt/live/${HOSTNAME}"
+TLS_FROM="n/a"
+TLS_TO="n/a"
+if [[ -r "${LE_DIR}/fullchain.pem" ]]; then
+  TLS_FROM="$(openssl x509 -in "${LE_DIR}/fullchain.pem" -noout -startdate 2>/dev/null | sed 's/notBefore=//')"
+  TLS_TO="$(openssl x509 -in "${LE_DIR}/fullchain.pem" -noout -enddate   2>/dev/null | sed 's/notAfter=//')"
+fi
+
+# ---------- пользователи (нормализация) ----------
+USERS_SECTION="нет данных"
+declare -a _users_raw=()
+if [[ -r /etc/dovecot/passdb/users ]]; then
+  mapfile -t _users_raw < <(cut -d: -f1 /etc/dovecot/passdb/users | sed '/^$/d' | sort -u)
+fi
+declare -a _users_norm=()
+if ((${#_users_raw[@]})); then
+  for u in "${_users_raw[@]}"; do
+    if [[ "$u" == *"@"* ]]; then
+      _users_norm+=( "$u" )
+    else
+      _users_norm+=( "$u@$DOMAIN" )
+    fi
+  done
+  if ((${#_users_norm[@]})); then
+    USERS_SECTION=$(
+      for e in "${_users_norm[@]}"; do echo "  - $e"; done
+    )
+  fi
+fi
+
+# Первый пользователь для DMARC rua (иначе postmaster)
+DMARC_RUA_ADDR="postmaster@${DOMAIN}"
+if ((${#_users_norm[@]})); then
+  DMARC_RUA_ADDR="${_users_norm[0]}"
+fi
+
+# ---------- DNS текущее ----------
+A_CURRENT="$(dig +short A "$HOSTNAME" 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
+have_A=no
+if [[ -n "$IPV4" && -n "$A_CURRENT" ]] && grep -qw "$IPV4" <<<"$A_CURRENT"; then
+  have_A=yes
+fi
+
+MX_TARGETS="$(dig +short MX "$DOMAIN" 2>/dev/null | awk '{print $2}' | sed 's/\.$//' | tr '\n' ' ')"
+have_MX=no
+if [[ -n "$MX_TARGETS" ]] && grep -qw "$HOSTNAME" <<<"$MX_TARGETS"; then
+  have_MX=yes
+fi
+
+SPF_PRESENT="$(dig +short TXT "$DOMAIN" 2>/dev/null | grep -i 'v=spf1' || true)"
+DMARC_PRESENT="$(dig +short TXT "_dmarc.${DOMAIN}" 2>/dev/null | grep -i 'v=DMARC1' || true)"
+
+DKIM_PRESENT="$(dig +short TXT "${SELECTOR}._domainkey.${DOMAIN}" 2>/dev/null | grep -i 'v=DKIM1' || true)"
+DKIM_UI_VALUE=""
+if [[ -s "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" ]]; then
+  # вытаскиваем только p=...
+  pub="$(tr -d '\n\"' < "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" | sed -E 's/^[^p]*p=([^; )]+).*/\1/' | tr -d '[:space:]')"
+  [[ -n "$pub" ]] && DKIM_UI_VALUE="v=DKIM1; h=sha256; k=rsa; p=${pub}"
+fi
+
+# PTR vs HELO
+PTR_HOST="$(dig +short -x "$IPV4" 2>/dev/null | sed 's/\.$//' | head -n1 || true)"
+HELO_PTR_STATUS="ok"
+if [[ -z "$PTR_HOST" || "$PTR_HOST" != "$HOSTNAME" ]]; then
+  HELO_PTR_STATUS="mismatch (PTR: ${PTR_HOST:-<none>}, HELO: ${HOSTNAME})"
+fi
+
+# ---------- соберём блок "Рекомендованные DNS" ----------
+DNS_LINES=()
+if [[ "$have_A" != "yes" && -n "$IPV4" ]]; then
+  DNS_LINES+=( "A     ${HOSTNAME}.           ${IPV4}" )
+fi
+if [[ "$have_MX" != "yes" ]]; then
+  DNS_LINES+=( "MX    ${DOMAIN}.          10 ${HOSTNAME}." )
+fi
+if [[ -n "$SPF_PRESENT" ]]; then
+  DNS_LINES+=( "SPF уже есть: ${SPF_PRESENT}" )
+else
+  DNS_LINES+=( "TXT   ${DOMAIN}.          v=spf1 mx -all" )
+fi
+if [[ -n "$DMARC_PRESENT" ]]; then
+  DNS_LINES+=( "DMARC уже есть: ${DMARC_PRESENT}" )
+else
+  DNS_LINES+=( "TXT   _dmarc.${DOMAIN}.   v=DMARC1; p=none; rua=mailto:${DMARC_RUA_ADDR}" )
+fi
+if [[ -n "$DKIM_PRESENT" ]]; then
+  DNS_LINES+=( "DKIM уже есть (${SELECTOR}): ${DKIM_PRESENT}" )
+elif [[ -n "$DKIM_UI_VALUE" ]]; then
+  DNS_LINES+=( "TXT   ${SELECTOR}._domainkey.${DOMAIN}.  ${DKIM_UI_VALUE}" )
+else
+  DNS_LINES+=( "DKIM: ключ не найден локально или не опубликован в DNS" )
+fi
+
+# ---------- формирование plain-text отчёта ----------
+{
+  echo "ОТЧЁТ ОБ УСТАНОВКЕ ПОЧТОВОГО СЕРВЕРА"
+  echo
+  echo "Узел:"
+  echo "  Хостнейм: ${HOSTNAME}"
+  echo "  Внешний IP: ${IPV4}"
+  echo "  Домен: ${DOMAIN}"
+  echo
+  echo "Версии ПО:"
+  echo "  Postfix:   ${POSTFIX_VER}"
+  echo "  Dovecot:   ${DOVECOT_VER}"
+  echo "  OpenDKIM:  ${OPENDKIM_VER}"
+  echo "  OpenDMARC: ${OPENDMARC_VER}"
+  echo "  Fail2ban:  ${FAIL2BAN_VER}"
+  echo "  Certbot:   ${CERTBOT_VER}"
+  echo
+  echo "Службы и порты:"
+  echo "  25  (SMTP):   ${PORT25}"
+  echo "  465 (SMTPS):  ${PORT465}"
+  echo "  587 (SUBM):   ${PORT587}"
+  echo "  993 (IMAPS):  ${PORT993}"
+  echo "  995 (POPS):   ${PORT995}"
+  echo
+  echo "Сертификат TLS (Let's Encrypt):"
+  echo "  Действует с:  ${TLS_FROM}"
+  echo "  Действует до: ${TLS_TO}"
+  echo
+  echo "Пользователи (созданы):"
+  echo "${USERS_SECTION}"
+  echo
+  echo "Рекомендованные DNS записи:"
+  for l in "${DNS_LINES[@]}"; do echo "  ${l}"; done
+  echo
+  echo "Дополнительно:"
+  echo "  PTR/HELO: ${HELO_PTR_STATUS}"
+  echo
+  echo "Где искать файлы:"
+  echo "  Манифест JSON: ${OUT_DIR}/manifest.json"
+  echo "  Отчёт (txt):   ${REPORT_TXT}"
+  echo "  Отчёт (md):    ${REPORT_MD}"
+  echo "  Логи установки: /var/log/msa-install.log"
+  echo "  Логи почты:     /var/log/mail.log"
+} > "$REPORT_TXT"
+
+# Дублируем тем же plain-text содержимым в .md (без Markdown — просто текст)
+cp -f "$REPORT_TXT" "$REPORT_MD"
+
+log INFO "Отчёт записан: $REPORT_TXT"
+
+# Краткая сводка в stdout — только то, что нужно добавить
+echo
+echo "==== DNS, которые нужно добавить сейчас ===="
+added_any=no
+if [[ "$have_A" != "yes" && -n "$IPV4" ]]; then
+  echo "A     ${HOSTNAME}.    ${IPV4}"; added_any=yes
+fi
+if [[ "$have_MX" != "yes" ]]; then
+  echo "MX    ${DOMAIN}.      10 ${HOSTNAME}."; added_any=yes
+fi
+if [[ -z "$SPF_PRESENT" ]]; then
+  echo "TXT   ${DOMAIN}.      v=spf1 mx -all"; added_any=yes
+fi
+if [[ -z "$DMARC_PRESENT" ]]; then
+  echo "TXT   _dmarc.${DOMAIN}.  v=DMARC1; p=none; rua=mailto:${DMARC_RUA_ADDR}"; added_any=yes
+fi
+if [[ -z "$DKIM_PRESENT" && -n "$DKIM_UI_VALUE" ]]; then
+  echo "TXT   ${SELECTOR}._domainkey.${DOMAIN}.  ${DKIM_UI_VALUE}"; added_any=yes
+fi
+[[ "$added_any" == "yes" ]] || echo "Ничего — базовые записи уже на месте."
+echo "Полный отчёт: $REPORT_TXT"

@@ -54,40 +54,38 @@ healthcheck::_s_client() {
   fi
 }
 
+# Вставь вместо старой функции healthcheck::check_tls
 healthcheck::check_tls() {
   log_info "HC: TLS проверки SMTPS(465), IMAPS(993) и STARTTLS на 587"
 
-  # 465 — SMTPS (прямой TLS)
-  local out rc
-  out="$(healthcheck::_s_client -connect 127.0.0.1:465 -servername "${HOSTNAME}" -verify_hostname "${HOSTNAME}" -brief 2>&1)" || rc=$?
-  if grep -qi 'Verify return code: 0 (ok)' <<<"$out"; then
-    export HC_SMTPS_465="ok"
-    log_info "HC: 465 SMTPS — сертификат валиден для ${HOSTNAME}"
-  else
-    export HC_SMTPS_465="error"
-    log_error "HC: 465 SMTPS — ошибка TLS/hostname. Вывод: ${out}"
-  fi
+  _tls_ok() { # host port [starttls_proto]
+    local host="$1" port="$2" starttls="${3:-}"
+    local out rc
+    if [[ -n "$starttls" ]]; then
+      out="$(timeout 10s openssl s_client -brief -verify_hostname "$host" -starttls "$starttls" -connect "$host:$port" </dev/null 2>&1 || true)"
+    else
+      out="$(timeout 10s openssl s_client -brief -verify_hostname "$host" -connect "$host:$port" </dev/null 2>&1 || true)"
+    fi
+    rc=$?
+    # Успех, если:
+    # - команда вернулась с кодом 0 И
+    # - в выводе есть "Verification: OK" или "Verify return code: 0" И
+    # - peername совпал
+    if [[ $rc -eq 0 ]] && \
+       echo "$out" | grep -Eq 'Verification: OK|Verify return code: 0' && \
+       echo "$out" | grep -Fq "Verified peername: $host"; then
+      echo "ok"; return 0
+    fi
+    log_error "HC: ${port} $( [[ -n $starttls ]] && echo SMTP STARTTLS || echo TLS ) — ошибка TLS/hostname. Вывод: $out"
+    echo "error"; return 1
+  }
 
-  # 993 — IMAPS
-  out="$(healthcheck::_s_client -connect 127.0.0.1:993 -servername "${HOSTNAME}" -verify_hostname "${HOSTNAME}" -brief 2>&1)" || rc=$?
-  if grep -qi 'Verify return code: 0 (ok)' <<<"$out"; then
-    export HC_IMAPS_993="ok"
-    log_info "HC: 993 IMAPS — сертификат валиден для ${HOSTNAME}"
-  else
-    export HC_IMAPS_993="error"
-    log_error "HC: 993 IMAPS — ошибка TLS/hostname. Вывод: ${out}"
-  fi
-
-  # 587 — STARTTLS SMTP
-  out="$(healthcheck::_s_client -starttls smtp -connect 127.0.0.1:587 -servername "${HOSTNAME}" -verify_hostname "${HOSTNAME}" -brief 2>&1 <<<'QUIT')" || rc=$?
-  if grep -qi 'Verify return code: 0 (ok)' <<<"$out"; then
-    export HC_SMTP_587_STARTTLS="ok"
-    log_info "HC: 587 SMTP STARTTLS — сертификат валиден для ${HOSTNAME}"
-  else
-    export HC_SMTP_587_STARTTLS="error"
-    log_error "HC: 587 SMTP STARTTLS — ошибка TLS/hostname. Вывод: ${out}"
-  fi
+  local h="$HOSTNAME"
+  export HC_SMTPS_465="$(_tls_ok "$h" 465 || true)"
+  export HC_IMAPS_993="$(_tls_ok "$h" 993 || true)"
+  export HC_SMTP_587_STARTTLS="$(_tls_ok "$h" 587 smtp || true)"
 }
+
 
 healthcheck::check_rdns_helo() {
   log_info "HC: проверка PTR(rDNS) и баннера Postfix (HELO)"

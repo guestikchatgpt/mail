@@ -1,245 +1,309 @@
 #!/usr/bin/env bash
-# install.sh — оркестратор: режимы install/print-dns/healthcheck и сборка manifest.json
-set -Eeuo pipefail
-IFS=$'\n\t'
+set -euo pipefail
 
-readonly SCRIPT_DIR="$( cd -- "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd )"
-readonly MODULES_DIR="${SCRIPT_DIR}/modules"
+# --- bootstrap logger used до загрузки общих хелперов ---
+if [[ "$(type -t log 2>/dev/null)" != "function" ]]; then
+  log(){ printf '[%(%FT%TZ)T] [%s] %s\n' -1 "${1:-INFO}" "${*:2}"; }
+fi
+if [[ "$(type -t run 2>/dev/null)" != "function" ]]; then
+  run(){ log INFO "RUN: $*"; "$@"; }
+fi
+# --- конец бутстрапа ---
 
-# libs
-# shellcheck source=lib/common.sh
-source "${SCRIPT_DIR}/lib/common.sh"
-# shellcheck source=lib/json_builder.sh
-source "${SCRIPT_DIR}/lib/json_builder.sh"
+# --- paths --------------------------------------------------------------------
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+MODULES_DIR="${SCRIPT_DIR}/modules"
+LIB_DIR="${SCRIPT_DIR}/lib"
 
+# --- libs ---------------------------------------------------------------------
+# Ожидаем lib/common.sh с функциями: log_info/log_warn/log_error, die, run_cmd, require_cmd
+# (они уже есть в проекте)
+# shellcheck disable=SC1090
+source "${LIB_DIR}/common.sh"
+
+# --- globals ------------------------------------------------------------------
 VARS_FILE=""
-DRY_RUN="false"
-MODE="install"  # install | print-dns | healthcheck
+MODE="install"        # install | healthcheck | print-dns
+DRY_RUN=false
+
+# --- utils --------------------------------------------------------------------
+require_yq_v4() {
+  require_cmd yq
+  # Пример вывода: "yq (https://github.com/mikefarah/yq/) version v4.47.1"
+  local out major
+  out="$(yq -V 2>&1 || true)"
+  major="$(grep -oE '[0-9]+' <<<"$out" | head -n1 || true)"
+  if [[ -z "${major:-}" || "${major}" -lt 4 ]]; then
+    die "Нужен yq v4+, найдено: ${out:-unknown}"
+  fi
+}
+
+ensure_root_if_needed() {
+  if [[ "${DRY_RUN}" == "false" && "${EUID}" -ne 0 ]]; then
+    die "Нужны root-привилегии (sudo) для режима установки"
+  fi
+}
+
+# ===== ensure yq v4+ =====
+ensure_yq_v4() {
+  _log(){ printf '[%(%FT%TZ)T] [%s] %s\n' -1 "${1:-INFO}" "${*:2}"; }
+
+  local need_major=4 cur="" major=""
+  if command -v yq >/dev/null 2>&1; then
+    cur="$(yq --version 2>/dev/null || true)"   # e.g. "yq (...) version v4.47.1"
+    major="$(printf '%s\n' "$cur" | sed -n 's/.*version v\{0,1\}\([0-9]\+\).*/\1/p')"
+    if [[ -n "$major" && "$major" -ge "$need_major" ]]; then
+      _log INFO "yq найден: ${cur}"
+      return 0
+    fi
+    _log WARN "нужен yq v4+, найдено: ${cur:-unknown} — обновляю бинарник"
+  else
+    _log INFO "yq не найден — ставлю свежий v4"
+  fi
+
+  # нужен wget или curl
+  if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+    _log INFO "ставлю wget для загрузки yq…"
+    apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get -y install wget ca-certificates >/dev/null 2>&1 || true
+  fi
+
+  local url="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+  if command -v wget >/dev/null 2>&1; then
+    wget -q "$url" -O /usr/local/bin/yq
+  else
+    curl -fsSL "$url" -o /usr/local/bin/yq
+  fi
+  chmod +x /usr/local/bin/yq || true
+
+  local newver; newver="$(yq --version 2>/dev/null || true)"
+  if ! grep -q 'version v4' <<<"$newver"; then
+    _log ERROR "не удалось установить yq v4 (текущее: ${newver})"
+    exit 1
+  fi
+  _log INFO "yq установлен: ${newver}"
+}
+
+ensure_yq_v4
 
 usage() {
-  cat >&2 <<'USAGE'
-Usage:
-  ./install.sh --vars <path/to/vars.yaml> [--dry-run] [--print-dns|--healthcheck]
-
-Options:
-  --vars PATH       Путь к YAML (обязательно)
-  --dry-run         Сухой прогон без изменений
-  --print-dns       Вывести готовые DNS-записи (JSON) и выйти
-  --healthcheck     Выполнить только проверки (JSON) и выйти
-  -h, --help        Показать помощь
-USAGE
+  printf '%s\n' \
+"usage: $0 --vars vars.yaml [--dry-run] [--healthcheck] [--print-dns]
+  --vars FILE      путь к vars.yaml (обязателен для install/print-dns)
+  --dry-run        не выполнять изменяющие команды (если реализовано в модулях)
+  --healthcheck    загрузить и запустить только 99_healthcheck.sh
+  --print-dns      вывести DNS-записи, которые нужно добавить вручную
+  -h, --help       показать эту справку"
 }
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --vars|-v) [[ $# -ge 2 ]] || { log_error "Флаг $1 требует аргумент"; usage; exit 1; }
-                 VARS_FILE="$2"; shift 2;;
-      --dry-run) DRY_RUN="true"; shift;;
-      --print-dns) MODE="print-dns"; shift;;
-      --healthcheck) MODE="healthcheck"; shift;;
-      -h|--help) usage; exit 0;;
-      *) log_error "Неизвестный аргумент: $1"; usage; exit 1;;
+      --vars)
+        [[ $# -ge 2 ]] || die "--vars требует путь к файлу"
+        VARS_FILE="$2"; shift 2;;
+      --dry-run)
+        DRY_RUN=true; shift;;
+      --healthcheck)
+        MODE="healthcheck"; shift;;
+      --print-dns)
+        MODE="print-dns"; shift;;
+      -h|--help)
+        usage; exit 0;;
+      *)
+        die "Неизвестный аргумент: $1";;
     esac
   done
-  [[ -n "${VARS_FILE}" ]] || { log_error "Не указан --vars <file>"; usage; exit 1; }
-  [[ -r "${VARS_FILE}" ]] || die 1 "Файл vars.yaml не читается: ${VARS_FILE}"
+  if [[ -z "${VARS_FILE}" && "${MODE}" != "healthcheck" ]]; then
+    die "Укажите --vars <file>"
+  fi
 }
 
-require_yq_v4() {
-  command -v yq >/dev/null 2>&1 || die 1 "Нужен yq v4: https://github.com/mikefarah/yq"
-  local raw v major
-  raw="$(yq --version 2>&1 || true)"
-  v="$(grep -oE 'version[[:space:]]+[0-9]+\.[0-9]+' <<<"$raw" | awk '{print $2}' || true)"
-  major="${v%%.*}"
-  [[ -n "$major" && "$major" -ge 4 ]] || die 1 "Нужен yq v4+, найдено: ${raw}"
-}
-
-# Экспорт базовых переменных среды из vars.yaml
 load_and_validate_vars() {
+  require_yq_v4
+  [[ -r "${VARS_FILE}" ]] || die "vars.yaml не найден: ${VARS_FILE}"
+
+  export DOMAIN
+  export HOSTNAME
+  export IPV4
+  export ACCEPT_INBOUND
+  export ACME_EMAIL
+  export DKIM_SELECTOR
+
   DOMAIN="$(yq -r '.domain // ""' "${VARS_FILE}")"
-  HOSTNAME="$(yq -r '.hostname // ""' "${VARS_FILE}")"
+  HOSTNAME="$(yq -r ".hostname // (\"mail.\" + .domain)" "${VARS_FILE}")"
   IPV4="$(yq -r '.ipv4 // ""' "${VARS_FILE}")"
   ACCEPT_INBOUND="$(yq -r '.accept_inbound // true' "${VARS_FILE}")"
-  BEGET_TOKEN="$(yq -r '.beget_token // ""' "${VARS_FILE}")"
-  USERS_JSON="$(yq -o=json '.users // []' "${VARS_FILE}")"
-  USERS_COUNT="$(yq -r '(.users // []) | length' "${VARS_FILE}")"
+  ACME_EMAIL="$(yq -r ".acme_email // (\"postmaster@\" + .domain)" "${VARS_FILE}")"
+  DKIM_SELECTOR="$(yq -r ".dkim_selector // \"s1\"" "${VARS_FILE}")"
 
-  if [[ -z "$HOSTNAME" && -n "$DOMAIN" ]]; then HOSTNAME="mail.${DOMAIN}"; fi
-  [[ -n "$DOMAIN"   ]] || die 1 "Отсутствует 'domain' в ${VARS_FILE}"
-  [[ -n "$HOSTNAME" ]] || die 1 "Отсутствует 'hostname' и не удалось вывести из domain"
-  [[ -n "$IPV4"     ]] || die 1 "Отсутствует 'ipv4' в ${VARS_FILE}"
-  if ! [[ "$IPV4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then die 1 "Некорректный ipv4: ${IPV4}"; fi
-  IFS='.' read -r o1 o2 o3 o4 <<<"$IPV4"; for o in "$o1" "$o2" "$o3" "$o4"; do (( o>=0 && o<=255 )) || die 1 "Некорректный ipv4: ${IPV4}"; done
-  if [[ "$USERS_COUNT" -lt 1 ]]; then die 1 "Секция 'users' пуста — нужен хотя бы один ящик"; fi
-  local bad_cnt; bad_cnt="$(yq -r '((.users // []) | map(select((.login // "") == "" or (.password // "") == "")) | length)' "${VARS_FILE}")"
-  [[ "$bad_cnt" == "0" ]] || die 1 "Некорректные пользователи в 'users' — пустой login/password"
+  local users_count
+  users_count="$(yq -r '.users // [] | length' "${VARS_FILE}")"
+
+  [[ -n "${DOMAIN}"   ]] || die "В vars.yaml отсутствует domain"
+  [[ -n "${HOSTNAME}" ]] || die "В vars.yaml отсутствует hostname/логика подстановки"
+  [[ -n "${IPV4}"    ]] || die "В vars.yaml отсутствует ipv4"
+  [[ "${users_count}" -ge 1 ]] || die "В vars.yaml нет пользователей (.users)"
+
+  if ! grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' <<<"${IPV4}"; then
+    die "Неверный формат IPv4: ${IPV4}"
+  fi
+
+  log_info "vars.yaml ок: domain=${DOMAIN}, hostname=${HOSTNAME}, ipv4=${IPV4}, users=${users_count}, mode=${MODE}, dry_run=${DRY_RUN}"
 }
 
-source_modules_in_order() {
-  shopt -s nullglob
-  local mods=("${MODULES_DIR}"/[0-9][0-9]_*.sh)
-  (( ${#mods[@]} > 0 )) || die 4 "Не найдено модулей в ${MODULES_DIR}"
-  for m in "${mods[@]}"; do
-    log_info "Загружаю модуль: $(basename "$m")"
-    # shellcheck source=/dev/null
-    source "$m"
+# --- module loader ------------------------------------------------------------
+source_modules_install() {
+  # Загрузим ВСЕ модули вида NN_name.sh (включая 100_report.sh и т.д.) по возрастанию
+  while IFS= read -r -d '' mod; do
+    log_info "Загружаю модуль: $(basename "$mod")"
+    # shellcheck disable=SC1090
+    source "$mod"
+  done < <(find "${MODULES_DIR}" -maxdepth 1 -type f -name '[0-9]*_*.sh' -print0 | sort -z -V)
+}
+
+source_module_healthcheck_only() {
+  local hc="${MODULES_DIR}/99_healthcheck.sh"
+  [[ -f "${hc}" ]] || die "Не найден modules/99_healthcheck.sh"
+  log_info "Загружаю модуль: 99_healthcheck.sh"
+  # shellcheck disable=SC1090
+  source "${hc}"
+}
+
+# --- manifest builder (встроенный фолбэк) -------------------------------------
+json_escape() {
+  local s="${1:-}"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"
+  printf '%s' "$s"
+}
+
+emit_manifest() {
+  local ports_json le_json dns_json auth_json hc_json
+
+  # ports (собираем PORT_*)
+  ports_json="{"
+  local first=true
+  while IFS='=' read -r k v; do
+    local port="${k#PORT_}"
+    $first || ports_json+=","
+    first=false
+    ports_json+="\"${port}\":\"$(json_escape "${v}")\""
+  done < <(env | grep -E '^PORT_[0-9]+=' || true)
+  ports_json+="}"
+
+  # le
+  le_json="{\"domain\":\"$(json_escape "${HOSTNAME}")\""
+  if [[ -n "${LE_VALID_UNTIL:-}" ]]; then
+    le_json+=",\"valid_until\":\"$(json_escape "${LE_VALID_UNTIL}")\""
+  fi
+  le_json+="}"
+
+  # dns
+  local dkim_selector="${DKIM_SELECTOR:-s1}"
+  local dkim_txt="${DKIM_DNS_TXT:-}"
+  local dmarc_txt="${DMARC_TXT:-v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}}"
+
+  dns_json="{"
+  dns_json+="\"selector\":\"$(json_escape "${dkim_selector}")\""
+  if [[ -n "${dkim_txt}" ]]; then
+    dns_json+=",\"txt\":\"$(json_escape "${dkim_txt}")\""
+  fi
+  dns_json+=",\"DMARC\":\"$(json_escape "${dmarc_txt}")\""
+  if [[ -n "${dkim_txt}" ]]; then
+    dns_json+=",\"DKIM\":{\"selector\":\"$(json_escape "${dkim_selector}")\",\"txt\":\"$(json_escape "${dkim_txt}")\"}"
+  fi
+  dns_json+="}"
+
+  # auth (логины из vars.yaml)
+  local logins
+  mapfile -t logins < <(yq -r '.users[]?.login // empty' "${VARS_FILE}")
+  auth_json="["
+  for i in "${!logins[@]}"; do
+    [[ $i -gt 0 ]] && auth_json+=","
+    auth_json+="\"$(json_escape "${logins[$i]}@${DOMAIN}")\""
   done
-}
+  auth_json+="]"
 
-source_single_module() {
-  local name="$1"
-  local f="${MODULES_DIR}/${name}"
-  [[ -r "$f" ]] || die 4 "Модуль не найден: ${f}"
-  log_info "Загружаю модуль: $(basename "$f")"
-  # shellcheck source=/dev/null
-  source "$f"
-}
+  # healthcheck (HC_*)
+  hc_json="{"
+  first=true
+  while IFS='=' read -r k v; do
+    $first || hc_json+=","
+    first=false
+    hc_json+="\"$(json_escape "${k#HC_}")\":\"$(json_escape "${v}")\""
+  done < <(env | grep -E '^HC_' || true)
+  hc_json+="}"
 
-# ---------- JSON helpers for manifest pieces ----------
+  local manifest
+  manifest="{"
+  manifest+="\"hostname\":\"$(json_escape "${HOSTNAME}")\","
+  manifest+="\"ipv4\":\"$(json_escape "${IPV4}")\","
+  manifest+="\"ports\":${ports_json},"
+  manifest+="\"le\":${le_json},"
+  manifest+="\"dns\":${dns_json},"
+  manifest+="\"auth\":{\"users_created\":${auth_json}},"
+  manifest+="\"healthcheck\":${hc_json}"
+  manifest+="}"
 
-build_ports_json() {
-  json_begin
-  json_add_string "25"  "${PORT_25:-$(health_default_port 25)}"
-  json_add_string "465" "${PORT_465:-$(health_default_port 465)}"
-  json_add_string "587" "${PORT_587:-$(health_default_port 587)}"
-  json_add_string "993" "${PORT_993:-$(health_default_port 993)}"
-  json_add_string "995" "${PORT_995:-$(health_default_port 995)}"
-  json_end
-}
-
-health_default_port() { # fallback если 99_healthcheck не запускался
-  case "$1" in
-    25|465|587|993|995) echo "open";;
-    *) echo "closed";;
-  esac
-}
-
-build_le_json() {
-  local le_domain="${LE_DOMAIN:-$HOSTNAME}"
-  local le_until="${LE_VALID_UNTIL:-}"
-  json_begin
-  json_add_string "domain" "${le_domain}"
-  json_add_string "valid_until" "${le_until}"
-  json_end
-}
-
-build_dns_json() {
-  local dkim_selector="${DKIM_SELECTOR:-$(yq -r '.dkim_selector // "s1"' "${VARS_FILE}")}"
-  local dkim_txt="${DKIM_TXT:-}"
-  json_begin
-  json_add_string "A"  "${IPV4}"
-  json_add_string "MX" "${HOSTNAME}"
-  json_add_string "SPF" "v=spf1 ip4:${IPV4} a:${HOSTNAME} ~all"
-
-  # DKIM object
-  json_begin
-  json_add_string "selector" "${dkim_selector}"
-  json_add_string "txt" "${dkim_txt}"
-  local dkim_obj; dkim_obj="$(json_end)"
-  json_add_object "DKIM" "${dkim_obj}"
-
-  # DMARC
-  json_add_string "DMARC" "v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}"
-  json_end
-}
-
-build_auth_json() {
-  # users_created: массив логинов из vars.yaml
-  mapfile -t __USERS < <(yq -r '(.users // [])[].login' "${VARS_FILE}")
-  json_begin
-  json_add_array_strings "users_created" "${__USERS[@]}"
-  json_end
-}
-
-build_health_json() {
-  json_begin
-  json_add_string "smtps_465"          "${HC_SMTPS_465:-error}"
-  json_add_string "smtp_587_starttls"  "${HC_SMTP_587_STARTTLS:-error}"
-  json_add_string "imaps_993"          "${HC_IMAPS_993:-error}"
-  json_add_string "dkim_sign"          "${HC_DKIM_SIGN:-error}"
-  json_add_string "helo_matches_ptr"   "${HC_HELO_MATCHES_PTR:-error}"
-  json_end
-}
-
-assemble_manifest() {
-  local ports_json le_json dns_json auth_json health_json
-  ports_json="$(build_ports_json)"
-  le_json="$(build_le_json)"
-  dns_json="$(build_dns_json)"
-  auth_json="$(build_auth_json)"
-  health_json="$(build_health_json)"
-
-  json_begin
-  json_add_string "hostname" "${HOSTNAME}"
-  json_add_string "ipv4"     "${IPV4}"
-  json_add_object "ports"    "${ports_json}"
-  json_add_object "le"       "${le_json}"
-  json_add_object "dns"      "${dns_json}"
-  json_add_object "auth"     "${auth_json}"
-  json_add_object "healthcheck" "${health_json}"
-  json_end
-}
-
-# ---------- modes ----------
-
-mode_print_dns() {
-  # только DNS-блок — пригодно для --print-dns
-  local dns_json; dns_json="$(build_dns_json)"
-  printf '%s\n' "${dns_json}"
-}
-
-mode_healthcheck() {
-  # Только модуль 99; печатаем {"healthcheck":{...}}
-  source_single_module "99_healthcheck.sh"
-  local health_json; health_json="$(build_health_json)"
-  json_begin
-  json_add_object "healthcheck" "${health_json}"
-  json_end
-  printf '\n'
-}
-
-mode_install() {
-  if [[ "${DRY_RUN}" != "true" ]]; then ensure_root_or_die; fi
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    echo "Dry run mode enabled for domain ${DOMAIN} (hostname ${HOSTNAME}, ipv4 ${IPV4})."
-    # в dry-run загружаем модули, но они ничего не меняют; manifest не пишем на диск
-  else
-    echo "Starting installation for domain ${DOMAIN} (hostname ${HOSTNAME}, ipv4 ${IPV4})..."
-  fi
-
-  source_modules_in_order  # включает 99_healthcheck в конце
-
-  # Сборка manifest
-  local manifest; manifest="$(assemble_manifest)"
-
-  # Вывод в stdout
+  run_cmd "install -d -m 0755 /var/local/msa"
+  local tmp; tmp="$(mktemp)"
+  printf '%s\n' "${manifest}" > "${tmp}"
+  run_cmd "install -m 0644 '${tmp}' /var/local/msa/manifest.json"
+  rm -f "${tmp}"
+  log_info "manifest.json записан в /var/local/msa/manifest.json"
   printf '%s\n' "${manifest}"
+}
 
-  # Запись на диск (кроме dry-run)
-  if [[ "${DRY_RUN}" != "true" ]]; then
-    run_cmd "install -d -m 0755 /var/local/msa"
-    # запись файла не должна идти через run_cmd (безопаснее прямой вывод)
-    tmp="$(mktemp)"; printf '%s\n' "${manifest}" > "${tmp}"
-    run_cmd "install -m 0644 '${tmp}' /var/local/msa/manifest.json"
-    rm -f "${tmp}"
-    log_info "manifest.json записан в /var/local/msa/manifest.json"
+# --- extra modes --------------------------------------------------------------
+run_print_dns() {
+  echo "=== DNS records to add for ${DOMAIN} / ${HOSTNAME} ==="
+  echo
+  echo "A     ${HOSTNAME}.      ${IPV4}"
+  echo "MX    ${DOMAIN}.        10 ${HOSTNAME}."
+  echo "TXT   ${DOMAIN}.        v=spf1 mx -all"
+  local dkim_selector="${DKIM_SELECTOR:-s1}"
+  if [[ -n "${DKIM_DNS_TXT:-}" ]]; then
+    echo "TXT   ${dkim_selector}._domainkey.${DOMAIN}.  ${DKIM_DNS_TXT}"
   else
-    log_info "DRY-RUN: manifest.json не записываю на диск"
+    echo "TXT   ${dkim_selector}._domainkey.${DOMAIN}.  (появится после генерации ключа)"
+  fi
+  echo "TXT   _dmarc.${DOMAIN}.  ${DMARC_TXT:-v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}}"
+  echo
+}
+
+# --- modes --------------------------------------------------------------------
+run_install() {
+  ensure_root_if_needed
+  echo "Starting installation for domain ${DOMAIN} (hostname ${HOSTNAME}, ipv4 ${IPV4})..."
+  source_modules_install
+  emit_manifest
+}
+
+run_healthcheck() {
+  source_module_healthcheck_only
+  if declare -F healthcheck::run_all >/dev/null 2>&1; then
+    healthcheck::run_all || true
+  else
+    die "В 99_healthcheck.sh нет функции healthcheck::run_all"
   fi
 }
 
+# --- main ---------------------------------------------------------------------
 main() {
   parse_args "$@"
-  require_yq_v4
-  load_and_validate_vars
-  log_info "vars.yaml ок: domain=${DOMAIN}, hostname=${HOSTNAME}, ipv4=${IPV4}, users=${USERS_COUNT}, mode=${MODE}, dry_run=${DRY_RUN}"
+
+  if [[ "${MODE}" != "healthcheck" ]]; then
+    load_and_validate_vars
+  else
+    log_info "mode=healthcheck"
+  fi
 
   case "${MODE}" in
-    print-dns) mode_print_dns ;;
-    healthcheck) mode_healthcheck ;;
-    install) mode_install ;;
-    *) die 1 "Неизвестный режим: ${MODE}" ;;
+    install)      run_install ;;
+    healthcheck)  run_healthcheck ;;
+    print-dns)    run_print_dns ;;
+    *)            die "Неизвестный режим: ${MODE}" ;;
   esac
 }
 

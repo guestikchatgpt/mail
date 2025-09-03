@@ -53,6 +53,18 @@ ssl::cert_valid_days_left() {
   now="$(date -u +%s)"; echo $(( (exp - now) / 86400 < 0 ? 0 : (exp - now) / 86400 ))
 }
 
+# проверка A-записи перед выпуском
+if command -v dig >/dev/null 2>&1; then
+  local arec
+  arec="$(dig +short A "${HOSTNAME}" | head -n1)"
+  if [[ -z "$arec" ]]; then
+    die 3 "LE: A-запись для ${HOSTNAME} не найдена. Создайте 'A ${HOSTNAME} ${IPV4}' и дождитесь резолва."
+  fi
+  if [[ "$arec" != "${IPV4}" ]]; then
+    die 3 "LE: ${HOSTNAME} A=${arec}, ожидается ${IPV4}. Исправьте DNS."
+  fi
+fi
+
 ssl::request_le_cert() {
   ssl::le_paths
   require_cmd certbot; require_cmd openssl
