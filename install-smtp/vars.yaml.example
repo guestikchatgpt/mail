@@ -1,9 +1,9 @@
 # vars.yaml.example — единственный источник параметров для инсталлятора
 
 # Базовые
-domain: example.ru
-hostname: mail.example.ru        # если пусто — подставится mail.<domain>
-ipv4: 1.1.1.1
+domain: example.com
+hostname: mail.example.com        # если пусто — подставится mail.<domain>
+ipv4: 1.1.1.1 # заменить на свой
 
 # Приём входящей почты на 25/tcp
 # true  — открываем 25 в фаерволе и включаем smtp/inet (порт 25) в Postfix
@@ -12,7 +12,7 @@ accept_inbound: true
 
 # Пользователи (виртуальные ящики)
 users:
-  - login: info@exapmle.ru
+  - login: info@example.com
     password: "S3cret!"
 
 # Let's Encrypt (можно переопределить адрес для регистрации)
