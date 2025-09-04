@@ -5,9 +5,10 @@ IFS=$'\n\t'
 
 prepare::system_packages() {
   log_info "Обновляю индекс пакетов и ставлю базовые зависимости"
-  run_cmd "apt-get update"
+  run_cmd apt-get update
 
-  local pkgs=(
+  # Базовый набор пакетов
+  local -a pkgs=(
     postfix
     dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-sieve dovecot-managesieved
     opendkim opendkim-tools opendmarc
@@ -15,12 +16,27 @@ prepare::system_packages() {
     rsyslog ca-certificates curl gnupg
     dnsutils iproute2 lsof
   )
-  pkg_available() { apt-cache show "$1" >/dev/null 2>&1; }
-  if pkg_available postfix-pcre; then pkgs+=(postfix-pcre); fi
 
-  local cmd=(DEBIAN_FRONTEND=noninteractive apt-get -y install --no-install-recommends)
-  for p in "${pkgs[@]}"; do cmd+=("$p"); done
-  run_cmd "${cmd[@]}"
+  # Добросим postfix-pcre при наличии в репах
+  pkg_available() { apt-cache show "$1" >/dev/null 2>&1; }
+  if pkg_available postfix-pcre; then
+    pkgs+=(postfix-pcre)
+  fi
+
+  log_info "Устанавливаю пакеты (${#pkgs[@]}): ${pkgs[*]}"
+
+  # Жёстко через env → исключаем нюансы run_cmd/IFS
+  if ! /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+        APT_LISTCHANGES_FRONTEND=none \
+        UCF_FORCE_CONFOLD=1 \
+        apt-get -y install --no-install-recommends "${pkgs[@]}"; then
+    log_warn "Первый apt-get install завершился ошибкой — пробую apt-get -f install и повтор"
+    /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get -f -y install
+    /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+      APT_LISTCHANGES_FRONTEND=none \
+      UCF_FORCE_CONFOLD=1 \
+      apt-get -y install --no-install-recommends "${pkgs[@]}"
+  fi
 }
 
 prepare::create_vmail_user() {

@@ -17,22 +17,46 @@ die() {
 }
 
 # Безопасное выполнение команд с уважением к DRY_RUN.
-# - Если вызвано с несколькими аргументами: исполняем напрямую (без bash -c).
-# - Если передана одна строка: совместимость со старым кодом через bash -c.
+# Поведение:
+# - Если передана одна строка — исполняем через bash -c (для пайпов и т.п.).
+# - Если передано несколько аргументов:
+#     * Если в начале идут присваивания вида KEY=VALUE — исполняем через /usr/bin/env KEY=VALUE cmd args...
+#     * Иначе — исполняем напрямую без шелла.
 run_cmd() {
   if [[ "${DRY_RUN:-false}" == "true" ]]; then
     log_info "DRY-RUN: $*"
     return 0
   fi
 
+  # Несколько аргументов → прямая exec с поддержкой префиксных VAR=VAL
   if [[ $# -gt 1 ]]; then
-    log_info "RUN: $*"
-    "$@"
-  else
-    local cmd="$*"
-    log_info "RUN: $cmd"
-    /bin/bash -o pipefail -c "$cmd"
+    local -a argv=( "$@" )
+    local i=0
+    # Ищем ведущие присваивания окружения KEY=VALUE
+    while (( i < ${#argv[@]} )); do
+      # Разрешаем только корректные имена переменных окружения
+      if [[ "${argv[$i]}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        ((i++))
+        continue
+      fi
+      break
+    done
+
+    if (( i > 0 )); then
+      # Есть хотя бы одно присваивание окружения → запускаем через env
+      log_info "RUN: env ${argv[*]}"
+      /usr/bin/env "${argv[@]}"
+    else
+      log_info "RUN: ${argv[*]}"
+      "${argv[@]}"
+    fi
+    return
   fi
+
+  # Один аргумент — строка (нужен шелл для пайпов/редиректов)
+  local cmd="$*"
+  log_info "RUN: $cmd"
+  /bin/bash -o pipefail -c "$cmd"
 }
 
 ensure_root_or_die() {

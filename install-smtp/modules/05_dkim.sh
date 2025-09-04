@@ -1,144 +1,129 @@
 #!/usr/bin/env bash
-# modules/05_dkim.sh — OpenDKIM (ключи, конфиг, milter с идемпотентной встройкой)
-set -Eeuo pipefail
-IFS=$'\n\t'
+# Module: OpenDKIM — keys, config, milter, clean TXT export + systemd override
 
-# --- мини-логгер при автономном запуске ---
-if [[ "$(type -t log 2>/dev/null)" != "function" ]]; then
-  log(){ printf '[%(%FT%TZ)T] [%s] %s\n' -1 "${1:-INFO}" "${*:2}"; }
-fi
-if [[ "$(type -t run 2>/dev/null)" != "function" ]]; then
-  run(){ log INFO "RUN: $*"; "$@"; }
-fi
+set -euo pipefail
+: "${SELECTOR:=s1}"
 
-VARS_FILE="${VARS_FILE:-${1:-vars.yaml}}"
+dkim::prepare_dirs() {
+  log INFO "OpenDKIM: подготовка ключей (selector=${SELECTOR}, domain=${DOMAIN})"
+  run_cmd install -d -m 0750 -o opendkim -g opendkim "/etc/opendkim/keys/${DOMAIN}"
+  run_cmd install -d -m 0750 -o opendkim -g postfix "/var/spool/postfix/opendkim"
+}
 
-DOMAIN="$(yq -r '.domain' "$VARS_FILE")"
-HOSTNAME="$(yq -r '.hostname // ("mail." + .domain)' "$VARS_FILE")"
-SELECTOR="$(yq -r '.dkim_selector // "s1"' "$VARS_FILE")"
+dkim::ensure_key() {
+  local key_priv="/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private"
+  local key_txt="/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt"
+  if [[ ! -s "$key_priv" || ! -s "$key_txt" ]]; then
+    log INFO "OpenDKIM: генерирую 2048-бит ключ (впервые)"
+    run_cmd opendkim-genkey -b 2048 -s "${SELECTOR}" -d "${DOMAIN}" -D "/etc/opendkim/keys/${DOMAIN}"
+  else
+    log INFO "OpenDKIM: ключ уже существует (${SELECTOR} @ ${DOMAIN}) — пропускаю генерацию"
+  fi
+  run_cmd chown opendkim:opendkim "$key_priv" "$key_txt"
+  run_cmd chmod 0600 "$key_priv"
+}
 
-KEYDIR="/etc/opendkim/keys/${DOMAIN}"
-PRIV="${KEYDIR}/${SELECTOR}.private"
-PUB="${KEYDIR}/${SELECTOR}.txt"
-
-log INFO "OpenDKIM: подготовка ключей (selector=${SELECTOR}, domain=${DOMAIN})"
-run install -d -m 0750 -o opendkim -g opendkim "$KEYDIR"
-run install -d -m 0750 -o opendkim -g postfix  "/var/spool/postfix/opendkim"
-
-if [[ ! -s "$PRIV" ]]; then
-  log INFO "OpenDKIM: генерирую 2048-бит ключ (впервые)"
-  run opendkim-genkey -b 2048 -s "$SELECTOR" -d "$DOMAIN" -D "$KEYDIR"
-  run chown opendkim:opendkim "$PRIV" "$PUB"
-  run chmod 0600 "$PRIV"
-else
-  log INFO "OpenDKIM: ключ уже существует (${SELECTOR} @ ${DOMAIN}) — пропускаю генерацию"
-  run chown opendkim:opendkim "$PRIV" "$PUB" || true
-  run chmod 0600 "$PRIV" || true
-fi
-
-# Чистое значение для TXT (v=DKIM1; k=rsa; p=...)
-_p_value="$(
-  tr -d '\n"' < "$PUB" \
-  | sed -E 's/^[^p]*p=([^; )]+).*/\1/' \
-  | tr -d '[:space:]'
-)"
-DKIM_UI_VALUE="v=DKIM1; h=sha256; k=rsa; p=${_p_value}"
-
-# Для BIND: режем p= по 240 символов
-_bind_chunks=""
-_tmp="$_p_value"
-while [[ -n "$_tmp" ]]; do
-  _bind_chunks+=$'\n'"\"${_tmp:0:240}\""
-  _tmp="${_tmp:240}"
-done
-
-# KeyTable/SigningTable/TrustedHosts
-log INFO "OpenDKIM: пишу KeyTable/SigningTable/TrustedHosts"
-install -m 0640 -o root -g opendkim <(cat <<EOF
-${SELECTOR}._domainkey.${DOMAIN} ${DOMAIN}:${SELECTOR}:${PRIV}
+dkim::write_tables() {
+  log INFO "OpenDKIM: пишу KeyTable/SigningTable/TrustedHosts"
+  run_cmd install -D -m 0644 /dev/stdin /etc/opendkim/KeyTable <<EOF
+${SELECTOR}._domainkey.${DOMAIN} ${DOMAIN}:${SELECTOR}:/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private
 EOF
-) /etc/opendkim/key.table
-
-install -m 0640 -o root -g opendkim <(cat <<EOF
+  run_cmd install -D -m 0644 /dev/stdin /etc/opendkim/SigningTable <<EOF
 *@${DOMAIN} ${SELECTOR}._domainkey.${DOMAIN}
 EOF
-) /etc/opendkim/signing.table
-
-install -m 0640 -o root -g opendkim <(cat <<'EOF'
+  run_cmd install -D -m 0644 /dev/stdin /etc/opendkim/TrustedHosts <<EOF
 127.0.0.1
-::1
 localhost
+${HOSTNAME}
+${IPV4}
 EOF
-) /etc/opendkim/trusted.hosts
-echo "$HOSTNAME" | install -m 0640 -o root -g opendkim /dev/stdin -T /etc/opendkim/trusted.hosts.tmp && \
-  cat /etc/opendkim/trusted.hosts >>/etc/opendkim/trusted.hosts.tmp && \
-  mv /etc/opendkim/trusted.hosts.tmp /etc/opendkim/trusted.hosts
+}
 
-# Конфиг и defaults
-log INFO "OpenDKIM: пишу конфигурацию и defaults (socket=local:/var/spool/postfix/opendkim/opendkim.sock)"
-install -m 0644 -o root -g root <(cat <<'EOF'
+dkim::write_config() {
+  log INFO "OpenDKIM: пишу конфигурацию (socket=/var/spool/postfix/opendkim/opendkim.sock)"
+  run_cmd install -D -m 0644 /dev/stdin /etc/opendkim.conf <<'CONF'
 Syslog                  yes
-UMask                   007
-UserID                  opendkim
+UMask                   002
 Mode                    sv
-AutoRestart             yes
-AutoRestartRate         10/1h
 Canonicalization        relaxed/simple
+AutoRestart             Yes
+AutoRestartRate         10/1h
 OversignHeaders         From
-KeyTable                /etc/opendkim/key.table
-SigningTable            refile:/etc/opendkim/signing.table
-ExternalIgnoreList      /etc/opendkim/trusted.hosts
-InternalHosts           /etc/opendkim/trusted.hosts
+SubDomains              yes
+UserID                  opendkim:opendkim
+KeyTable                /etc/opendkim/KeyTable
+SigningTable            /etc/opendkim/SigningTable
+ExternalIgnoreList      /etc/opendkim/TrustedHosts
+InternalHosts           /etc/opendkim/TrustedHosts
 Socket                  local:/var/spool/postfix/opendkim/opendkim.sock
+SignatureAlgorithm      rsa-sha256
+MinimumKeyBits          1024
+CONF
+}
+
+dkim::service_override() {
+  run_cmd install -d -m 0755 /etc/systemd/system/opendkim.service.d
+  run_cmd install -m 0644 /dev/stdin /etc/systemd/system/opendkim.service.d/override.conf <<'EOF'
+[Service]
+ExecStartPre=/usr/bin/install -d -m0750 -o opendkim -g postfix /var/spool/postfix/opendkim
+ExecStartPre=/usr/bin/rm -f /var/spool/postfix/opendkim/opendkim.sock
+ExecStart=
+ExecStart=/usr/sbin/opendkim -f -x /etc/opendkim.conf -p local:/var/spool/postfix/opendkim/opendkim.sock
+Type=simple
 EOF
-) /etc/opendkim/opendkim.conf
+  run_cmd systemctl daemon-reload
+}
 
-install -m 0644 -o root -g root <(cat <<'EOF'
-SOCKET="local:/var/spool/postfix/opendkim/opendkim.sock"
-RUNDIR="/run/opendkim"
-EOF
-) /etc/default/opendkim
+dkim::enable_service() {
+  run_cmd systemctl enable --now opendkim || true
+  run_cmd systemctl restart opendkim
+}
 
-# Удобный файл для UI/DNS
-install -d -m 0755 /var/local/msa
-cat > /var/local/msa/dkim.txt <<EOF
-# DKIM для ${DOMAIN} (selector: ${SELECTOR})
+dkim::attach_milter() {
+  local sock="unix:/var/spool/postfix/opendkim/opendkim.sock"
+  local cur_smtpd; cur_smtpd="$(postconf -h smtpd_milters || true)"
+  local cur_non;   cur_non="$(postconf -h non_smtpd_milters || true)"
 
-Имя: ${SELECTOR}._domainkey.${DOMAIN}.
-Тип: TXT
-Значение:
-${DKIM_UI_VALUE}
-
-# BIND:
-${SELECTOR}._domainkey.${DOMAIN}.  IN TXT (
-"v=DKIM1; h=sha256; k=rsa; p="
-${_bind_chunks}
-)
-EOF
-chmod 0644 /var/local/msa/dkim.txt
-
-# Идемпотентная встройка milter в Postfix
-add_milter_if_missing() {
-  local param="$1" want="$2"
-  local cur; cur="$(postconf -h "$param" || true)"
-  if [[ "$cur" == *"$want"* ]]; then
-    log INFO "OpenDKIM: $param уже содержит $want"
+  if [[ "${cur_smtpd}" != *"${sock}"* ]]; then
+    [[ -n "${cur_smtpd}" ]] && run_cmd postconf -e "smtpd_milters=${cur_smtpd},${sock}" \
+                           || run_cmd postconf -e "smtpd_milters=${sock}"
   else
-    if [[ -n "$cur" ]]; then
-      run postconf -e "$param=${cur},${want}"
-    else
-      run postconf -e "$param=${want}"
-    fi
+    log INFO "OpenDKIM: smtpd_milters уже содержит ${sock}"
+  fi
+
+  if [[ "${cur_non}" != *"${sock}"* ]]; then
+    [[ -n "${cur_non}" ]] && run_cmd postconf -e "non_smtpd_milters=${cur_non},${sock}" \
+                          || run_cmd postconf -e "non_smtpd_milters=${sock}"
+  else
+    log INFO "OpenDKIM: non_smtpd_milters уже содержит ${sock}"
+  fi
+
+  run_cmd postconf -e "milter_default_action=accept"
+  run_cmd postconf -e "milter_protocol=6"
+  run_cmd systemctl reload postfix
+}
+
+dkim::export_clean_txt() {
+  local txt="/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt"
+  local out="/var/local/msa/dkim.txt"
+  run_cmd install -d -m 0755 /var/local/msa
+
+  local value
+  value="$(sed -e 's/[[:space:]]\+/ /g' -e 's/\"//g' "$txt" | tr -d '\n' | sed -E 's/.*TXT \(([^)]*)\).*/\1/')" || value=""
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value" | run_cmd install -m 0644 /dev/stdin "$out"
+    log INFO "OpenDKIM: чистое значение для DNS записано в $out"
+  else
+    log WARN "OpenDKIM: не удалось распарсить ${txt} — проверь файл"
   fi
 }
 
-add_milter_if_missing "smtpd_milters" "unix:/var/spool/postfix/opendkim/opendkim.sock"
-add_milter_if_missing "non_smtpd_milters" "unix:/var/spool/postfix/opendkim/opendkim.sock"
-run postconf -e "milter_default_action=accept"
-run postconf -e "milter_protocol=6"
-
-run systemctl enable --now opendkim
-run systemctl restart opendkim
-run systemctl reload postfix || run systemctl restart postfix
-
-log INFO "OpenDKIM: готово. Чистое значение для DNS записано в /var/local/msa/dkim.txt"
+# --- run ---
+dkim::prepare_dirs
+dkim::ensure_key
+dkim::write_tables
+dkim::write_config
+dkim::service_override
+dkim::enable_service
+dkim::attach_milter
+dkim::export_clean_txt

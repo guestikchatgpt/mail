@@ -1,98 +1,68 @@
-# modules/07_fail2ban.sh — Fail2ban jails для Postfix/Dovecot (+ postfix-sasl)
-# Требует: run_cmd, log_info, log_warn, log_error, die, require_cmd
-# Зависимости: fail2ban, rsyslog (для /var/log/mail.log)
-# shellcheck shell=bash
+#!/usr/bin/env bash
+# Module: Fail2ban jails + postfix-sasl filter + disable IPv6 warnings
 
-fail2ban::paths() {
-  F2B_DIR="/etc/fail2ban"
-  F2B_JAILD="${F2B_DIR}/jail.d"
-  F2B_CONF="${F2B_JAILD}/msa-mail.conf"
-  F2B_FILTER_DIR="${F2B_DIR}/filter.d"
+set -euo pipefail
+
+f2b::write_global_ipv6_off() {
+  log INFO "Fail2ban: глобально выключаю IPv6 (allowipv6 = no)"
+  run_cmd install -D -m 0644 /dev/stdin /etc/fail2ban/fail2ban.local <<'CONF'
+[Definition]
+allowipv6 = no
+CONF
 }
 
-fail2ban::require_bins() {
-  require_cmd fail2ban-client
-  require_cmd systemctl
-}
-
-fail2ban::detect_banaction() {
-  BANACTION=""
-  BANACTION_ALLPORTS=""
-
-  if command -v ufw >/dev/null 2>&1; then
-    if ufw status 2>/dev/null | grep -qEi '^Status:\s+active'; then
-      BANACTION="ufw"
-      BANACTION_ALLPORTS="ufw"
-      log_info "Fail2ban: активен UFW — banaction=ufw"
-    fi
+f2b::ensure_filter_postfix_sasl() {
+  local f="/etc/fail2ban/filter.d/postfix-sasl.conf"
+  if [[ ! -f "$f" ]]; then
+    log INFO "Fail2ban: не найден фильтр postfix-sasl.conf — создаю"
+    run_cmd install -D -m 0644 /dev/stdin "$f" <<'CONF'
+[Definition]
+failregex = (?i)postfix/smtpd\[\d+\]:\s+warning:\s+[-\w\.:]+\[<HOST>\]:\s+SASL (?:LOGIN|PLAIN|AUTH) authentication failed: .*
+            (?i)authentication failure;.*\bSASL\b.*user=<[^>]*>.*rip=<HOST>
+ignoreregex =
+CONF
   fi
 }
 
-fail2ban::warn_if_missing_filters() {
-  fail2ban::paths
-  for f in postfix.conf dovecot.conf postfix-sasl.conf; do
-    [[ -r "${F2B_FILTER_DIR}/${f}" ]] || log_warn "Fail2ban: отсутствует фильтр ${f} — проверь установку пакета fail2ban"
-  done
+f2b::write_jails() {
+  log INFO "Fail2ban: пишу конфиг jails в /etc/fail2ban/jail.d/msa-mail.conf"
+  run_cmd install -D -m 0644 /dev/stdin /etc/fail2ban/jail.d/msa-mail.conf <<'CONF'
+[DEFAULT]
+backend = auto
+banaction = ufw
+findtime = 10m
+maxretry = 5
+bantime = 1h
+ignoreip = 127.0.0.1/8
+
+[postfix]
+enabled = true
+filter  = postfix
+port    = smtp,submission,465
+logpath = /var/log/mail.log
+
+[postfix-sasl]
+enabled = true
+filter  = postfix-sasl
+port    = smtp,submission,465
+logpath = /var/log/mail.log
+
+[dovecot]
+enabled = true
+filter  = dovecot
+port    = imap,imaps,pop3,pop3s
+logpath = /var/log/mail.log
+CONF
 }
 
-fail2ban::write_jail_conf() {
-  fail2ban::paths
-  fail2ban::detect_banaction
-
-  log_info "Fail2ban: пишу конфиг jails в ${F2B_CONF}"
-
-  local tmp; tmp="$(mktemp)"
-  {
-    echo '# Managed by msa-install — DO NOT EDIT'
-    echo '[DEFAULT]'
-    echo 'findtime = 10m'
-    echo 'bantime  = 1h'
-    echo 'maxretry = 5'
-    echo 'backend  = auto'
-    if [[ -n "${BANACTION}" ]]; then
-      echo "banaction = ${BANACTION}"
-      echo "banaction_allports = ${BANACTION_ALLPORTS}"
-    fi
-    echo
-    echo '[postfix]'
-    echo 'enabled = true'
-    echo 'port    = smtp,submission,smtps'
-    echo 'logpath = /var/log/mail.log'
-    # filter = postfix
-    echo
-    echo '[postfix-sasl]'
-    echo 'enabled = true'
-    echo 'port    = smtp,submission,smtps'
-    echo 'logpath = /var/log/mail.log'
-    # filter = postfix-sasl
-    echo
-    echo '[dovecot]'
-    echo 'enabled = true'
-    echo 'port    = pop3,pop3s,imap,imaps'
-    echo 'logpath = /var/log/mail.log'
-    # filter = dovecot
-  } > "${tmp}"
-
-  run_cmd "install -D -m 0644 '${tmp}' '${F2B_CONF}'"
-  rm -f "${tmp}"
+f2b::reload() {
+  log INFO "Fail2ban: включаю сервис и перезагружаю конфигурацию"
+  run_cmd systemctl enable --now fail2ban
+  run_cmd fail2ban-client reload
 }
 
-fail2ban::reload_enable() {
-  log_info "Fail2ban: включаю сервис и перезагружаю конфигурацию"
-  run_cmd "systemctl enable --now fail2ban"
-  if ! run_cmd "fail2ban-client reload"; then
-    run_cmd "systemctl restart fail2ban"
-  fi
-  # Неболезненная проверка статуса jails
-  run_cmd "fail2ban-client status" || true
-  for j in postfix postfix-sasl dovecot; do
-    run_cmd "fail2ban-client status ${j}" || true
-  done
-}
-
-# --- ENTRYPOINT ---
-fail2ban::paths
-fail2ban::require_bins
-fail2ban::warn_if_missing_filters
-fail2ban::write_jail_conf
-fail2ban::reload_enable
+# --- run ---
+f2b::write_global_ipv6_off
+f2b::ensure_filter_postfix_sasl
+f2b::write_jails
+f2b::reload
