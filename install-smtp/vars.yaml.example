@@ -1,26 +1,36 @@
-# vars.yaml.example — единственный источник параметров для инсталлятора
+# единственный источник правды для инсталлятора
 
-# Базовые
+# Базовое
 domain: example.com
-hostname: mail.example.com        # если пусто — подставится mail.<domain>
-ipv4: 1.1.1.1 # заменить на свой
+hostname: mail.example.com      # если не указать — инсталлятор подставит mail.<domain>
+ipv4: 1.2.3.4
 
 # Приём входящей почты на 25/tcp
-# true  — открываем 25 в фаерволе и включаем smtp/inet (порт 25) в Postfix
-# false — 25 не открываем и отключаем smtp/inet (оставляем только submission/smtps)
-accept_inbound: true
+accept_inbound: true            # true — слушаем 25 и открываем fw; false — только 465/587
 
-# Пользователи (виртуальные ящики)
+# Пользователи (виртуальные ящики Dovecot) — ЛОГИНЫ И ПАРОЛИ НА МЕСТЕ
 users:
   - login: info@example.com
     password: "S3cret!"
+  # - login: sales@example.com
+  #   password: "AnotherS3cret!"
 
-# Let's Encrypt (можно переопределить адрес для регистрации)
-acme_email: info@example.ru
+# Let's Encrypt
+acme_email: noc@example.com
 
-# DKIM (селектор ключа; по умолчанию s1)
-dkim_selector: s1
+# DKIM
+dkim_selector: s1               # селектор для 05_dkim.sh
 
-# Опционально: токен DNS-провайдера для автоматизации публикации записей
-# (Beget/Cloudflare и т.п.; модуль 09_dns_update.sh)
-beget_token: ""
+# Beget API для 09_beget_dns.sh
+beget:
+  login: "mybegetlogin"         # не e-mail, именно логин аккаунта Beget
+  token: "xxxxxxxxxxxxxxxx"     # API-токен из панели Beget
+
+# Тонкая настройка 09_beget_dns.sh (всё опционально)
+dns_update:
+  dry_run: false                # true = только показать diff (или добавь флаг --dry-run в CLI)
+  ttl_default: 3600
+  spf_policy: warn              # warn|append — warn: не трогаем существующий SPF; append: аккуратно добавим a:<hostname>
+  msa_state_dir: /var/local/msa
+  msa_manifest: /var/local/msa/manifest.json
+  msa_dkim_txt: /var/local/msa/dkim.txt
