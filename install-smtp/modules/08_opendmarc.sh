@@ -1,3 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
 # modules/08_opendmarc.sh — OpenDMARC milter
 # shellcheck shell=bash
 set -Eeuo pipefail

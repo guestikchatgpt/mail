@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 09_beget_dns.sh — авто-деплой DNS в Beget
+# 09_beget_dns.sh — авто-деплой DNS в Beget с нормализацией DKIM TXT
+#
 # Реальность API Beget:
 # - getData работает по APEX (зоне), поддомены до первой записи не отдаются (METHOD_FAILED)
 # - changeRecords принимает records={A|MX|TXT|...} с полями priority/value для ОДНОГО fqdn
@@ -8,11 +9,16 @@
 # 2) строим desired для:
 #    - mail.<domain> (A)
 #    - <domain>      (MX + SPF TXT, A сохраняем как в current_apex — «бережно»)
-#    - sX._domainkey.<domain> (TXT DKIM)
-#    - _dmarc.<domain> (TXT DMARC — опционально, по умолчанию добавляем если отсутствует в DNS)
+#    - sX._domainkey.<domain> (TXT DKIM) — значение нормализуем (без кавычек/скобок/контролов)
+#    - _dmarc.<domain> (TXT DMARC — по умолчанию добавляем, если отсутствует в DNS)
 # 3) собираем payload {priority,value} и вызываем changeRecords для каждого FQDN по очереди
-# Верификация: dig к public DNS (API не показывает поддомены до первой записи)
+# Верификация: dig к public DNS (API не показывает поддомены до создания)
+
 set -Eeuo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
 
 # ====== ПАРАМЕТРЫ ======
 VARS_FILE="${VARS_FILE:-vars.yaml}"
@@ -20,10 +26,10 @@ MSA_STATE_DIR="${MSA_STATE_DIR:-/var/local/msa}"
 MSA_MANIFEST="${MSA_MANIFEST:-$MSA_STATE_DIR/manifest.json}"
 MSA_DKIM_TXT="${MSA_DKIM_TXT:-$MSA_STATE_DIR/dkim.txt}"
 
-TTL_DEFAULT="${TTL_DEFAULT:-3600}"              # только информативно для вывода
+TTL_DEFAULT="${TTL_DEFAULT:-3600}"              # информативно для вывода
 SPF_POLICY="${SPF_POLICY:-warn}"                # warn|append
 DNS_DRY_RUN="${DNS_DRY_RUN:-false}"             # --dry-run
-DMARC_MODE="${DMARC_MODE:-ifabsent}"            # ifabsent|force (по умолчанию бережно)
+DMARC_MODE="${DMARC_MODE:-ifabsent}"            # ifabsent|force (бережно по умолчанию)
 
 # ====== ЛОГИ/ТРАП ======
 ts(){ date -u +'%Y-%m-%dT%H:%M:%SZ'; }
@@ -70,6 +76,21 @@ jq_safe_file(){ local file="$1" filter="$2"; [[ -f "$file" ]] || { echo ""; retu
 manifest_get(){ jq_safe_file "$MSA_MANIFEST" "$1"; }
 trimdot(){ local s="${1:-}"; echo "${s%.}"; }
 
+# ВАЖНО: нормализация DKIM из «зонного» формата → в «плоский» printable TXT
+sanitize_dkim_value() {
+  tr -d '\r' \
+  | sed -e 's/;.*$//' \
+        -e 's/^[[:space:]]*[^"]*"//' \
+        -e 's/"[[:space:]]*"[[:space:]]*/ /g' \
+        -e 's/"[[:space:]]*)[[:space:]]*$//' \
+        -e 's/^[[:space:]]*(//; s/)[[:space:]]*$//' \
+        -e 's/\\"/"/g' \
+        -e 's/\\//g' \
+  | tr -d '\n\t' \
+  | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+
 # ====== КОНФИГ ======
 DOMAIN="$(yq_get '.domain')"
 HOSTNAME="$(yq_get '.hostname')"
@@ -97,8 +118,12 @@ DMARC_FQDN="$(trimdot "_dmarc.$DOMAIN")"
 
 DKIM_VALUE=""
 if [[ -f "$MSA_DKIM_TXT" ]]; then
-  DKIM_VALUE="$(tr -d '\n' <"$MSA_DKIM_TXT" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  DKIM_VALUE="$(sanitize_dkim_value <"$MSA_DKIM_TXT")"
+  # Гарантируем корректные разделители:
+  DKIM_VALUE="$(printf '%s' "$DKIM_VALUE" \
+    | sed -E 's/^v=DKIM1[[:space:]]*/v=DKIM1; /; s/DKIM1;?[[:space:]]*p=/DKIM1; p=/')"
 fi
+
 DMARC_VALUE_DEFAULT="v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN%.}"
 dm_yaml="$(manifest_get '.dns.DMARC')"
 [[ -n "$dm_yaml" ]] && DMARC_VALUE_DEFAULT="$dm_yaml"
@@ -198,15 +223,14 @@ merge_spf() {
   fi
 }
 
-# Итоговый SPF (в кавычках API не требует; передаём голую строку)
+# Итоговый SPF
 if [[ "$SPF_POLICY" == "warn" && -n "${cur_spf:-}" ]]; then
   want_spf="$cur_spf"
 else
   want_spf="$(merge_spf "${cur_spf:-}" "$MAIL_FQDN")"
 fi
 
-# ====== УТИЛИТА: формирование payload {priority,value} ======
-# На вход — newline-списки значений (можно пустые). Возврат — JSON-объект с ключами, где массивы не пустые.
+# ====== УТИЛИТА: формирование payload {priority,value}
 mk_payload(){
   local a_lines="$1" mx_lines="$2" txt_lines="$3"
   local ja jmx jtxt
@@ -228,23 +252,29 @@ mk_payload(){
 # mail.<domain>: только A
 payload_mail="$(mk_payload "$IPV4" "" "")"
 
-# apex: бережно — A оставляем как есть (из текущих), MX ставим на mail.<domain>, SPF — по policy
+# apex: A — как есть (бережно), MX — на mail.<domain>, SPF — по policy
 apex_A_lines="$(printf '%s\n' "$apex_A" | sed '/^$/d')"
 apex_MX_want="10 $MAIL_FQDN"
 payload_apex="$(mk_payload "$apex_A_lines" "$apex_MX_want" "$want_spf")"
 
-# DKIM (если ключ сгенерен)
+# DKIM (если ключ сгенерен) — значение уже нормализовано
 payload_dkim="{}"
 if [[ -n "$DKIM_VALUE" ]]; then
+  # sanity-check: должна быть v=DKIM1; и p=
+  if ! grep -qi '^v=DKIM1;' <<<"$DKIM_VALUE"; then
+    WARN "DKIM_VALUE не начинается с v=DKIM1; — проверьте $MSA_DKIM_TXT"
+  fi
+  if ! grep -qi 'p=' <<<"$DKIM_VALUE"; then
+    WARN "В DKIM_VALUE отсутствует p= — проверьте $MSA_DKIM_TXT"
+  fi
   payload_dkim="$(mk_payload "" "" "$DKIM_VALUE")"
 else
-  WARN "DKIM-файл не найден ($MSA_DKIM_TXT) — пропускаю DKIM."
+  WARN "DKIM-файл не найден или пуст ($MSA_DKIM_TXT) — пропускаю DKIM."
 fi
 
 # DMARC: по умолчанию — если отсутствует в DNS (бережно), либо force
 need_dmarc=true
 if [[ "$DMARC_MODE" == "ifabsent" ]]; then
-  # Проверим через публичный DNS (API не даёт поддоменов до создания)
   if dig +short TXT "$DMARC_FQDN" | grep -qi 'v=DMARC1'; then
     need_dmarc=false
     INFO "DMARC уже существует в DNS — пропускаю (режим ifabsent)."
@@ -256,18 +286,15 @@ $need_dmarc && payload_dmarc="$(mk_payload "" "" "$DMARC_VALUE_DEFAULT")"
 # ====== APPLY ======
 apply_one(){
   local fqdn="$1" payload="$2"
-  # Пустой объект — нечего делать (например, нет DKIM/DMARC в выбранном режиме)
   if [[ -z "${payload//[[:space:]]/}" || "$payload" = "{}" ]]; then
     INFO "[$fqdn] изменений нет (payload пуст)"
     return 0
   fi
-
   if [[ "$DNS_DRY_RUN" == "true" ]]; then
     INFO "[$fqdn] DRY-RUN: payload →"
     echo "$payload" | jq -S .
     return 0
   fi
-
   [[ "${BEGET_DEBUG:-0}" == "1" ]] && { >&2 echo "DEBUG desired($fqdn):"; echo "$payload" | jq -S . >&2; }
 
   INFO "[$fqdn] changeRecords…"

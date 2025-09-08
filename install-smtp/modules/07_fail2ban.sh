@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
 # Module: Fail2ban jails + postfix-sasl filter + адаптивный banaction (функции + entrypoint)
 set -euo pipefail
-. "$(dirname "$0")/../lib/common.sh"
+
 
 f2b::_detect_banaction() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'active'; then

@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
 set -Eeuo pipefail
 IFS=$'\n\t'
 _log() { printf '[%(%FT%TZ)T] [%s] %s\n' -1 "$1" "$2"; }

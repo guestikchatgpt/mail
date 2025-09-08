@@ -1,3 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
 # modules/02_firewall.sh — открыть нужные порты, если FW активен
 # Порты: 465, 587, 993, 995, 80, и УСЛОВНО 25 (accept_inbound)
 # Требует: run_cmd, log_info; переменная: ACCEPT_INBOUND

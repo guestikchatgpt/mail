@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
 # Module: Финальный отчёт (ТОЛЬКО report.txt; manifest.json не трогаем)
 set -euo pipefail
-. "$(dirname "$0")/../lib/common.sh"
+
 : "${VARS_FILE:?}"
 
 report::_yq(){ yq -r "$1" "${VARS_FILE}"; }

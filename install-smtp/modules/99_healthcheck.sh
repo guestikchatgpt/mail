@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
 # Module: Dovecot passwd-file + SMTP AUTH + Maildir и первичная инициализация
 set -euo pipefail
-. "$(dirname "$0")/../lib/common.sh"
+
 : "${VARS_FILE:?}"
 
 dovecot::_yq() { yq -r "$1" "${VARS_FILE}"; }

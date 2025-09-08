@@ -2,7 +2,11 @@
 # shellcheck shell=bash
 set -Eeuo pipefail
 IFS=$'\n\t'
-
+shopt -s expand_aliases
+alias log::info='log_info'
+alias log::warn='log_warn'
+alias log::error='log_error'
+alias log::err='log_error'
 _ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 log_info()  { printf '[%s] [INFO]  %s\n'  "$(_ts)" "$*" >&2; }

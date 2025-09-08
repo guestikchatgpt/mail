@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
 # Module: SSL/Certbot + TLS для Postfix/Dovecot (функции + entrypoint)
 set -euo pipefail
 
 # используем общий логгер/раннер
-. "$(dirname "$0")/../lib/common.sh"
+
 : "${VARS_FILE:?}"
 
 ssl::_yq() { yq -r "$1" "${VARS_FILE}"; }
