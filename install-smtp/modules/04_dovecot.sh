@@ -1,35 +1,31 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091
+# Module: Dovecot passwd-file + SMTP AUTH + Maildir и первичная инициализация
 set -euo pipefail
 . "$(dirname "$0")/../lib/common.sh"
+: "${VARS_FILE:?}"
 
-# === Новый код: маленькие функции поверх существующей логики ===
+dovecot::_yq() { yq -r "$1" "${VARS_FILE}"; }
 
 dovecot::ensure_passdb_dir() {
-  run install -d -m 0750 -o root -g dovecot /etc/dovecot/passdb
+  run_cmd install -d -m 0750 -o root -g dovecot /etc/dovecot/passdb
 }
 
 dovecot::render_passdb_from_vars() {
   local users_file=/etc/dovecot/passdb/users
   : >"$users_file"
-  # читаем логины/пароли из vars.yaml (yq v4)
   while IFS=$'\t' read -r LOGIN PASSWORD; do
-    [[ -n "$LOGIN" && -n "$PASSWORD" ]] || continue
-    local HASH
-    HASH="$(doveadm pw -s SHA512-CRYPT -p "$PASSWORD")"
+    [[ -n "${LOGIN:-}" && -n "${PASSWORD:-}" ]] || continue
+    local HASH; HASH="$(doveadm pw -s SHA512-CRYPT -p "$PASSWORD")"
     printf '%s:%s\n' "$LOGIN" "$HASH" >>"$users_file"
-  done < <(yq -r '.users[] | [.login, .password] | @tsv' "$VARS")
-
-  run chown root:dovecot "$users_file"
-  run chmod 0640 "$users_file"
+  done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
+  run_cmd chown root:dovecot "$users_file"
+  run_cmd chmod 0640 "$users_file"
 }
 
 dovecot::enable_passwdfile_auth() {
-  # отключаем system auth, включаем passwd-file (idempotent)
-  run sed -i 's/^!include[[:space:]]\+auth-system\.conf\.ext/#!include auth-system.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
-  run sed -i 's/^#\s*!include[[:space:]]\+auth-passwdfile\.conf\.ext/!include auth-passwdfile.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
+  run_cmd sed -i 's/^!include[[:space:]]\+auth-system\.conf\.ext/#!include auth-system.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
+  run_cmd sed -i 's/^#\s*!include[[:space:]]\+auth-passwdfile\.conf\.ext/!include auth-passwdfile.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
 
-  # auth-passwdfile.conf.ext — только если отличается/нет
   local cfg=/etc/dovecot/conf.d/auth-passwdfile.conf.ext
   local desired; desired="$(cat <<'EOF'
 passdb {
@@ -43,13 +39,12 @@ userdb {
 EOF
 )"
   if ! cmp -s <(printf '%s' "$desired") "$cfg" 2>/dev/null; then
-    log "Dovecot: обновляю $cfg"
-    printf '%s' "$desired" | run install -D -m 0644 /dev/stdin "$cfg"
+    log_info "Dovecot: обновляю $cfg"
+    printf '%s' "$desired" | run_cmd install -D -m 0644 /dev/stdin "$cfg"
   fi
 }
 
 dovecot::postfix_auth_socket() {
-  # отдельный include, чтобы не гадать, какой файл переопределит сервис
   local cfg=/etc/dovecot/conf.d/90-postfix-auth.conf
   local desired; desired="$(cat <<'EOF'
 auth_mechanisms = plain login
@@ -64,47 +59,58 @@ service auth {
 EOF
 )"
   if ! cmp -s <(printf '%s' "$desired") "$cfg" 2>/dev/null; then
-    log "Dovecot: пишу $cfg"
-    printf '%s' "$desired" | run install -D -m 0644 /dev/stdin "$cfg"
+    log_info "Dovecot: пишу $cfg"
+    printf '%s' "$desired" | run_cmd install -D -m 0644 /dev/stdin "$cfg"
   fi
-
-  run install -d -m 0750 -o postfix -g postfix /var/spool/postfix/private
+  run_cmd install -d -m 0750 -o postfix -g postfix /var/spool/postfix/private
 }
 
-dovecot::ensure_maildir_location() {
-  # не трогаем, если уже задано явно
+dovecot::ensure_mail_location() {
   if ! dovecot -n 2>/dev/null | grep -q '^mail_location ='; then
-    log "Dovecot: задаю mail_location (Maildir)"
-    cat <<'EOF' | run install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa.conf
+    log_info "Dovecot: задаю mail_location (Maildir)"
+    cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-maildir.conf
 mail_location = maildir:/var/vmail/%d/%n/Maildir
 protocols = imap lmtp sieve pop3
 EOF
   fi
 }
 
-dovecot::restart_and_selftest() {
-  run systemctl enable --now dovecot
-  run systemctl restart dovecot
+dovecot::init_maildirs_and_inbox() {
+  # создаём каталоги и INBOX для всех пользователей
+  while IFS=$'\t' read -r LOGIN _; do
+    [[ -n "${LOGIN:-}" ]] || continue
+    local d="/var/vmail/${LOGIN#*@}/${LOGIN%@*}"
+    run_cmd install -d -m 0750 -o vmail -g vmail "$d/Maildir"/{cur,new,tmp}
+    # создаём INBOX через doveadm (не падаем, если уже есть)
+    if ! doveadm mailbox list -u "$LOGIN" >/dev/null 2>&1; then
+      :
+    fi
+    doveadm mailbox create -u "$LOGIN" INBOX >/dev/null 2>&1 || true
+    log_info "Dovecot: подготовлен Maildir для ${LOGIN}"
+  done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
+}
 
-  # быстрый самотест на первом пользователе
+dovecot::restart_and_selftest() {
+  run_cmd systemctl enable --now dovecot
+  run_cmd systemctl restart dovecot
+
   local u p
-  u="$(yq -r '.users[0].login' "$VARS")"
-  p="$(yq -r '.users[0].password' "$VARS")"
+  u="$(dovecot::_yq '.users[0].login')"
+  p="$(dovecot::_yq '.users[0].password')"
   if doveadm auth test -x service=smtp "$u" "$p" >/dev/null 2>&1; then
-    log "Dovecot: SMTP AUTH OK ($u)"
+    log_info "Dovecot: SMTP AUTH OK (${u})"
   else
-    warn "Dovecot: SMTP AUTH FAIL ($u) — проверь /var/log/mail.log"
+    log_warn "Dovecot: SMTP AUTH FAIL (${u}) — см. /var/log/mail.log"
   fi
 }
 
-# === Точка входа модуля (сохраняем стиль/структуру) ===
 module::main() {
-  log "Dovecot: настраиваю passwd-file и SMTP AUTH для Postfix"
   dovecot::ensure_passdb_dir
   dovecot::render_passdb_from_vars
   dovecot::enable_passwdfile_auth
   dovecot::postfix_auth_socket
-  dovecot::ensure_maildir_location
+  dovecot::ensure_mail_location
+  dovecot::init_maildirs_and_inbox
   dovecot::restart_and_selftest
 }
 

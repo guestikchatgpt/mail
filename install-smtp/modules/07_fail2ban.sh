@@ -1,10 +1,24 @@
 #!/usr/bin/env bash
-# Module: Fail2ban jails + postfix-sasl filter + disable IPv6 warnings
-
+# Module: Fail2ban jails + postfix-sasl filter + адаптивный banaction (функции + entrypoint)
 set -euo pipefail
+. "$(dirname "$0")/../lib/common.sh"
+
+f2b::_detect_banaction() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'active'; then
+    echo "ufw"
+  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+    echo "firewallcmd-rich-rules"
+  elif command -v iptables >/dev/null 2>&1; then
+    echo "iptables-multiport"
+  elif command -v nft >/dev/null 2>&1; then
+    echo "nftables"
+  else
+    echo "iptables-multiport"  # разумный дефолт
+  fi
+}
 
 f2b::write_global_ipv6_off() {
-  log INFO "Fail2ban: глобально выключаю IPv6 (allowipv6 = no)"
+  log_info "Fail2ban: выключаю IPv6 (allowipv6 = no)"
   run_cmd install -D -m 0644 /dev/stdin /etc/fail2ban/fail2ban.local <<'CONF'
 [Definition]
 allowipv6 = no
@@ -14,7 +28,7 @@ CONF
 f2b::ensure_filter_postfix_sasl() {
   local f="/etc/fail2ban/filter.d/postfix-sasl.conf"
   if [[ ! -f "$f" ]]; then
-    log INFO "Fail2ban: не найден фильтр postfix-sasl.conf — создаю"
+    log_info "Fail2ban: создаю фильтр postfix-sasl.conf"
     run_cmd install -D -m 0644 /dev/stdin "$f" <<'CONF'
 [Definition]
 failregex = (?i)postfix/smtpd\[\d+\]:\s+warning:\s+[-\w\.:]+\[<HOST>\]:\s+SASL (?:LOGIN|PLAIN|AUTH) authentication failed: .*
@@ -25,11 +39,12 @@ CONF
 }
 
 f2b::write_jails() {
-  log INFO "Fail2ban: пишу конфиг jails в /etc/fail2ban/jail.d/msa-mail.conf"
-  run_cmd install -D -m 0644 /dev/stdin /etc/fail2ban/jail.d/msa-mail.conf <<'CONF'
+  local banaction; banaction="$(f2b::_detect_banaction)"
+  log_info "Fail2ban: banaction=${banaction}"
+  run_cmd install -D -m 0644 /dev/stdin /etc/fail2ban/jail.d/msa-mail.conf <<CONF
 [DEFAULT]
 backend = auto
-banaction = ufw
+banaction = ${banaction}
 findtime = 10m
 maxretry = 5
 bantime = 1h
@@ -56,13 +71,15 @@ CONF
 }
 
 f2b::reload() {
-  log INFO "Fail2ban: включаю сервис и перезагружаю конфигурацию"
+  log_info "Fail2ban: включаю сервис и перегружаю конфиг"
   run_cmd systemctl enable --now fail2ban
   run_cmd fail2ban-client reload
 }
 
-# --- run ---
-f2b::write_global_ipv6_off
-f2b::ensure_filter_postfix_sasl
-f2b::write_jails
-f2b::reload
+module::main() {
+  f2b::write_global_ipv6_off
+  f2b::ensure_filter_postfix_sasl
+  f2b::write_jails
+  f2b::reload
+}
+module::main "$@"

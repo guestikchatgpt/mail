@@ -1,72 +1,61 @@
 #!/usr/bin/env bash
-# Module: Final report & manifest (no yq; clean DKIM; no noise)
-
+# Module: Финальный отчёт (ТОЛЬКО report.txt; manifest.json не трогаем)
 set -euo pipefail
+. "$(dirname "$0")/../lib/common.sh"
+: "${VARS_FILE:?}"
 
-# Ожидаем, что окружение уже загружено install.sh (DOMAIN, HOSTNAME, IPV4, SELECTOR?, log/run_cmd)
-: "${SELECTOR:=s1}"
+report::_yq(){ yq -r "$1" "${VARS_FILE}"; }
 
-# --- helpers ---
-port_state() {
-  local p="$1"
-  if ss -ltn "sport = :${p}" 2>/dev/null | grep -q LISTEN; then
-    echo "open"
-  else
-    echo "closed"
-  fi
+report::vars() {
+  DOMAIN="$(report::_yq '.domain')"
+  HOSTNAME="$(report::_yq '.hostname // ("mail." + .domain)')"
+  IPV4="$(report::_yq '.ipv4')"
+  SELECTOR="$(report::_yq '.dkim_selector // "s1"')"
 }
 
-# Состояния портов
-P25="$(port_state 25)"
-P465="$(port_state 465)"
-P587="$(port_state 587)"
-P993="$(port_state 993)"
-P995="$(port_state 995)"
+report::port_state() {
+  local p="$1"
+  if ss -ltn 2>/dev/null | grep -q "[:.]${p}[[:space:]]"; then
+    echo "open"; else echo "closed"; fi
+}
 
-# DMARC по умолчанию (можешь переопределить переменной окружения DMARC_VALUE)
-DMARC_VALUE="${DMARC_VALUE:-v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}}"
+report::dkim_value() {
+  local v=""
+  if [[ -f /var/local/msa/dkim.txt ]]; then
+    v="$(tr -d '\n' </var/local/msa/dkim.txt || true)"
+  fi
+  if [[ -z "$v" && -f "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" ]]; then
+    v="$(sed -e 's/[[:space:]]\+/ /g' -e 's/\"//g' "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" \
+       | tr -d '\n' | sed -E 's/.*TXT \(([^)]*)\).*/\1/' || true)"
+  fi
+  [[ -n "$v" ]] && printf '%s' "$v" || printf '<см. %s.txt в /etc/opendkim/keys/%s/>' "$SELECTOR" "$DOMAIN"
+}
 
-# Чистое значение DKIM
-DKIM_VALUE=""
-if [[ -f /var/local/msa/dkim.txt ]]; then
-  DKIM_VALUE="$(tr -d '\n' </var/local/msa/dkim.txt || true)"
-fi
-if [[ -z "$DKIM_VALUE" && -f "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" ]]; then
-  # Фоллбэк-парсер из s1.txt (удаляем кавычки/переносы и вытаскиваем содержимое скобок TXT (...))
-  DKIM_VALUE="$(sed -e 's/[[:space:]]\+/ /g' -e 's/\"//g' "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" \
-               | tr -d '\n' | sed -E 's/.*TXT \(([^)]*)\).*/\1/' || true)"
-fi
-[[ -z "$DKIM_VALUE" ]] && DKIM_VALUE="<см. ${SELECTOR}.txt в /etc/opendkim/keys/${DOMAIN}/>"
+report::write() {
+  local P25 P465 P587 P993 P995 DKIM_VALUE DMARC_VALUE
+  P25="$(report::port_state 25)"
+  P465="$(report::port_state 465)"
+  P587="$(report::port_state 587)"
+  P993="$(report::port_state 993)"
+  P995="$(report::port_state 995)"
+  DKIM_VALUE="$(report::dkim_value)"
+  DMARC_VALUE="${DMARC_VALUE:-v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}}"
 
-# --- report.txt ---
-run_cmd install -d -m 0755 /var/local/msa
-run_cmd install -m 0644 /dev/stdin /var/local/msa/report.txt <<EOF
-==== DNS, которые нужно добавить сейчас ====
+  run_cmd install -d -m 0755 /var/local/msa
+  run_cmd install -m 0644 /dev/stdin /var/local/msa/report.txt <<EOF
+==== DNS, которые нужно добавить ====
 A     ${HOSTNAME}.                     ${IPV4}
 MX    ${DOMAIN}.                       10 ${HOSTNAME}.
 TXT   _dmarc.${DOMAIN}.                ${DMARC_VALUE}
 TXT   ${SELECTOR}._domainkey.${DOMAIN}.  ${DKIM_VALUE}
 
 [*] PTR/rDNS: у провайдера выставьте PTR для ${IPV4} → ${HOSTNAME}.
-EOF
-log INFO "Отчёт записан: /var/local/msa/report.txt"
 
-# --- manifest.json (без yq; чистый JSON) ---
-run_cmd install -m 0644 /dev/stdin /var/local/msa/manifest.json <<JSON
-{
-  "hostname": "${HOSTNAME}",
-  "ipv4": "${IPV4}",
-  "ports": {
-    "25":  "${P25}",
-    "465": "${P465}",
-    "587": "${P587}",
-    "993": "${P993}",
-    "995": "${P995}"
-  },
-  "le": { "domain": "${HOSTNAME}" },
-  "dns": { "selector": "${SELECTOR}", "DMARC": "${DMARC_VALUE}" },
-  "auth": { "users_created": [] },
-  "healthcheck": {}
+==== Порты (локальный LISTEN) ====
+25=${P25}, 465=${P465}, 587=${P587}, 993=${P993}, 995=${P995}
+EOF
+  log_info "Отчёт записан: /var/local/msa/report.txt"
 }
-JSON
-log INFO "manifest.json записан в /var/local/msa/manifest.json"
+
+module::main() { report::vars; report::write; }
+module::main "$@"
