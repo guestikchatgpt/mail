@@ -2,15 +2,19 @@
 # Module: Postfix base config + TLS hardening + services (25/465/587)
 # Uses env: DOMAIN, HOSTNAME, IPV4, ACCEPT_INBOUND
 
+set -Eeuo pipefail
+IFS=$'\n\t'
+
 postfix::write_mailname() {
+  # В install.sh мы используем log_info, а здесь старый log INFO. Приводим к одному виду.
   if [[ -n "${HOSTNAME:-}" ]]; then
-    log INFO "Пишу /etc/mailname = ${HOSTNAME}"
+    log_info "Пишу /etc/mailname = ${HOSTNAME}"
     printf '%s\n' "$HOSTNAME" | run_cmd tee /etc/mailname >/dev/null
   fi
 }
 
 postfix::base_config() {
-  log INFO "Postfix: базовая конфигурация и TLS-жёсткость (TLS1.2+)"
+  log_info "Postfix: базовая конфигурация и TLS-жёсткость (TLS1.2+)"
   run_cmd postconf -e \
     "myhostname=${HOSTNAME}" \
     "myorigin=${DOMAIN}" \
@@ -40,22 +44,26 @@ postfix::virtual_maps() {
   local map=/etc/postfix/virtual_mailbox_maps
   [[ -f "$map" ]] || printf '# filled by installer\n' | run_cmd install -m 0644 /dev/stdin "$map"
   run_cmd postmap "hash:${map}"
-  run_cmd postconf -e "virtual_alias_maps=hash:${map}"
+  run_cmd postconf -e "virtual_mailbox_maps=hash:${map}"
 }
 
 postfix::services() {
-  log INFO "Postfix: настраиваю master.cf для smtp(25), submission(587), smtps(465)"
+  log_info "Postfix: настраиваю master.cf для smtp(25), submission(587), smtps(465) и отключаю chroot для milter'ов"
+
   # Основной SMTP (25)
-  run_cmd postconf -M "smtp/inet=smtp inet n - y - - smtpd"
+  # Пятый параметр ('chroot') ставим в 'n' (no), чтобы Postfix видел сокеты milter'ов
+  run_cmd postconf -M "smtp/inet=smtp inet n - n - - smtpd"
 
   # Submission (587) — STARTTLS обязателен
-  run_cmd postconf -M "submission/inet=submission inet n - y - - smtpd"
+  # Пятый параметр ('chroot') также ставим в 'n'
+  run_cmd postconf -M "submission/inet=submission inet n - n - - smtpd"
   run_cmd postconf -P "submission/inet/smtpd_tls_security_level=encrypt"
   run_cmd postconf -P "submission/inet/smtpd_sasl_auth_enable=yes"
   run_cmd postconf -P "submission/inet/smtpd_client_restrictions=permit_sasl_authenticated,reject"
 
   # SMTPS (465) — TLS wrapper
-  run_cmd postconf -M "smtps/inet=smtps inet n - y - - smtpd"
+  # Пятый параметр ('chroot') также ставим в 'n'
+  run_cmd postconf -M "smtps/inet=smtps inet n - n - - smtpd"
   run_cmd postconf -P "smtps/inet/smtpd_tls_wrappermode=yes"
   run_cmd postconf -P "smtps/inet/smtpd_sasl_auth_enable=yes"
   run_cmd postconf -P "smtps/inet/smtpd_client_restrictions=permit_sasl_authenticated,reject"
@@ -69,7 +77,7 @@ postfix::services() {
     run_cmd postconf -P "smtps/inet/smtpd_tls_cert_file=${cert}"
     run_cmd postconf -P "smtps/inet/smtpd_tls_key_file=${key}"
   else
-    log WARN "Postfix: LE-сертификат отсутствует — активирую TLS позднее (модуль 06_ssl)"
+    log_warn "Postfix: LE-сертификат отсутствует — активирую TLS позднее (модуль 06_ssl)"
   fi
 }
 
@@ -79,7 +87,10 @@ postfix::reload() {
   run_cmd bash -c "systemctl reload postfix || systemctl restart postfix"
   # Мини-проверка
   if ss -ltn '( sport = :25 or sport = :465 or sport = :587 )' | grep -q LISTEN; then
-    log INFO "Postfix: 25/465/587 — LISTEN"
+    log_info "Postfix: 25/465/587 — LISTEN"
+  else
+    # Добавим осмысленную ошибку, если Postfix так и не запустился
+    log_error "Postfix: После перезапуска ни один из портов (25, 465, 587) не слушается. Проверяй `journalctl -u postfix`"
   fi
 }
 

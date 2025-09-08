@@ -24,7 +24,7 @@ dkim_selector: s1               # селектор для 05_dkim.sh
 # Beget API для 09_beget_dns.sh
 beget:
   login: "mybegetlogin"         # не e-mail, именно логин аккаунта Beget
-  token: "xxxxxxxxxxxxxxxx"     # API-токен из панели Beget
+  password: "xxxxxxxxxxxxxxxx"     # API-токен из панели Beget
 
 # Тонкая настройка 09_beget_dns.sh (всё опционально)
 dns_update:

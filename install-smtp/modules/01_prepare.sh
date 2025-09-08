@@ -69,7 +69,15 @@ EOF
   run_cmd sysctl -p "$conf"
 }
 
+prepare::add_postfix_to_milter_groups() {
+  log_info "Добавляю пользователя postfix в группы opendkim и opendmarc для доступа к сокетам"
+  run_cmd usermod -a -G opendkim postfix
+  run_cmd usermod -a -G opendmarc postfix
+}
+
+
 # --- ENTRYPOINT ---
 prepare::system_packages
 prepare::create_vmail_user
 prepare::disable_ipv6
+prepare::add_postfix_to_milter_groups
