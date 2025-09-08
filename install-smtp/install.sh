@@ -224,20 +224,17 @@ emit_manifest() {
   dns_json+="\"selector\":\"$(json_escape "${dkim_selector}")\""
   if [[ -n "${dkim_txt}" ]]; then
     dns_json+=",\"txt\":\"$(json_escape "${dkim_txt}")\""
-  fi
-  dns_json+=",\"DMARC\":\"$(json_escape "${dmarc_txt}")\""
-  if [[ -n "${dkim_txt}" ]]; then
     dns_json+=",\"DKIM\":{\"selector\":\"$(json_escape "${dkim_selector}")\",\"txt\":\"$(json_escape "${dkim_txt}")\"}"
   fi
+  dns_json+=",\"DMARC\":\"$(json_escape "${dmarc_txt}")\""
   dns_json+="}"
 
-  # auth (логины из vars.yaml)
+  # auth (логины из vars.yaml) — ИСПРАВЛЕНО: без 'empty' для yq v4
   local logins
-  mapfile -t logins < <(yq -r '.users[]?.login // empty' "${VARS_FILE}")
+  mapfile -t logins < <(yq -r '.users[]?.login // ""' "${VARS_FILE}" | sed '/^$/d')
   auth_json="["
   for i in "${!logins[@]}"; do
     [[ $i -gt 0 ]] && auth_json+=","
-    # нормализуем как user@DOMAIN
     if [[ "${logins[$i]}" == *"@"* ]]; then
       auth_json+="\"$(json_escape "${logins[$i]}")\""
     else
@@ -256,6 +253,7 @@ emit_manifest() {
   done < <(env | grep -E '^HC_' || true)
   hc_json+="}"
 
+  # итоговый объект
   local manifest
   manifest="{"
   manifest+="\"hostname\":\"$(json_escape "${HOSTNAME}")\","
@@ -275,7 +273,6 @@ emit_manifest() {
   log_info "manifest.json записан в /var/local/msa/manifest.json"
   printf '%s\n' "${manifest}"
 }
-# (блок emit_manifest основан на твоём текущем инсталлере). :contentReference[oaicite:2]{index=2}
 
 # --- extra modes --------------------------------------------------------------
 run_print_dns() {
