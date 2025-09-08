@@ -1,31 +1,46 @@
 #!/usr/bin/env bash
-# 09_beget_dns.sh — авто-деплой DNS в Beget:
-# - единственный источник конфигурации: vars.yaml
-# - dry-run (--dry-run)
-# - бережные изменения (per-FQDN changeRecords)
-# - пост-верификация базовых записей
-# Требует: curl, dig, jq, yq
-
+# 09_beget_dns.sh — авто-деплой DNS в Beget
+# Реальность API Beget:
+# - getData работает по APEX (зоне), поддомены до первой записи не отдаются (METHOD_FAILED)
+# - changeRecords принимает records={A|MX|TXT|...} с полями priority/value для ОДНОГО fqdn
+# Подход:
+# 1) один getData по APEX — формируем current_apex (A/MX/TXT)
+# 2) строим desired для:
+#    - mail.<domain> (A)
+#    - <domain>      (MX + SPF TXT, A сохраняем как в current_apex — «бережно»)
+#    - sX._domainkey.<domain> (TXT DKIM)
+#    - _dmarc.<domain> (TXT DMARC — опционально, по умолчанию добавляем если отсутствует в DNS)
+# 3) собираем payload {priority,value} и вызываем changeRecords для каждого FQDN по очереди
+# Верификация: dig к public DNS (API не показывает поддомены до первой записи)
 set -Eeuo pipefail
 
-# ========= ЛОГИ =========
+# ====== ПАРАМЕТРЫ ======
+VARS_FILE="${VARS_FILE:-vars.yaml}"
+MSA_STATE_DIR="${MSA_STATE_DIR:-/var/local/msa}"
+MSA_MANIFEST="${MSA_MANIFEST:-$MSA_STATE_DIR/manifest.json}"
+MSA_DKIM_TXT="${MSA_DKIM_TXT:-$MSA_STATE_DIR/dkim.txt}"
+
+TTL_DEFAULT="${TTL_DEFAULT:-3600}"              # только информативно для вывода
+SPF_POLICY="${SPF_POLICY:-warn}"                # warn|append
+DNS_DRY_RUN="${DNS_DRY_RUN:-false}"             # --dry-run
+DMARC_MODE="${DMARC_MODE:-ifabsent}"            # ifabsent|force (по умолчанию бережно)
+
+# ====== ЛОГИ/ТРАП ======
 ts(){ date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 log(){ echo "[$(ts)] [$1] $2"; }
 INFO(){ log INFO "$*"; }
 WARN(){ log WARN "$*"; }
 ERR(){ log ERROR "$*"; }
-
 trap 'ERR "Ошибка на линии $LINENO: \"$BASH_COMMAND\""; exit 1' ERR
 
-# ========= ФЛАГИ =========
-DNS_DRY_RUN=false
+# ====== ФЛАГИ ======
 for a in "$@"; do
   case "$a" in
     --dry-run) DNS_DRY_RUN=true ;;
   esac
 done
 
-# ========= УТИЛИТЫ =========
+# ====== ЗАВИСИМОСТИ ======
 need_bin(){ command -v "$1" >/dev/null 2>&1; }
 APT_UPDATED=0
 ensure_bin(){
@@ -37,59 +52,42 @@ ensure_bin(){
         apt-get -y update >/dev/null
         APT_UPDATED=1
       fi
-      INFO "Устанавливаю пакет $pkg (для $b)…"
-      apt-get -y install --no-install-recommends "$pkg" >/dev/null
+      INFO "Устанавливаю пакет $pkg"
+      DEBIAN_FRONTEND=noninteractive apt-get -y install --no-install-recommends "$pkg" >/dev/null
     else
-      ERR "Не найден пакетный менеджер для установки $b"; exit 1
+      ERR "Не найден пакетный менеджер для установки $pkg"; exit 1
     fi
   fi
-  command -v "$b" >/dev/null 2>&1 || { ERR "Не удалось установить $b"; exit 1; }
 }
-
 ensure_bin curl curl
-ensure_bin dig  dnsutils
-ensure_bin jq   jq
-ensure_bin yq   yq
+ensure_bin dig dnsutils
+ensure_bin jq jq
+ensure_bin yq yq
 
-# ========= КОНФИГ =========
-VARS_FILE="${VARS_FILE:-vars.yaml}"
-[[ -f "$VARS_FILE" ]] || { ERR "vars.yaml не найден (ожидалось: $VARS_FILE)"; exit 1; }
+# ====== ХЕЛПЕРЫ ======
+yq_get(){ local expr="$1"; yq -r "$expr // \"\"" "$VARS_FILE" 2>/dev/null; }
+jq_safe_file(){ local file="$1" filter="$2"; [[ -f "$file" ]] || { echo ""; return 0; }; jq -r "$filter // empty" "$file" 2>/dev/null || true; }
+manifest_get(){ jq_safe_file "$MSA_MANIFEST" "$1"; }
+trimdot(){ local s="${1:-}"; echo "${s%.}"; }
 
-# Чтение из vars.yaml с безопасным default=empty
-yq_get(){ yq -r "${1} // empty" "$VARS_FILE"; }
-
+# ====== КОНФИГ ======
 DOMAIN="$(yq_get '.domain')"
 HOSTNAME="$(yq_get '.hostname')"
 IPV4="$(yq_get '.ipv4')"
+[[ -z "$HOSTNAME" && -n "$DOMAIN" ]] && HOSTNAME="mail.$DOMAIN"
 
-# Блок Beget-кредов (поддержка login+token ИЛИ login+password)
 BEGET_LOGIN="$(yq_get '.beget.login')"
-BEGET_TOKEN="$(yq_get '.beget.token')"
-BEGET_PASSWORD="$(yq_get '.beget.password')"   # опционально, на будущее
+BEGET_PASSWORD="$(yq_get '.beget.password')"
 
-[[ -n "$DOMAIN" ]]   || { ERR "В vars.yaml не задан .domain"; exit 1; }
-if [[ -z "${HOSTNAME}" || "${HOSTNAME}" == "null" ]]; then
-  HOSTNAME="mail.${DOMAIN}"
-fi
-[[ -n "$IPV4" ]]     || { ERR "В vars.yaml не задан .ipv4"; exit 1; }
+spfp_from_yaml="$(yq_get '.beget.spf_policy')"
+ttl_from_yaml="$(yq_get '.beget.ttl_default')"
+[[ -n "$spfp_from_yaml" ]] && SPF_POLICY="$spfp_from_yaml"
+[[ -n "$ttl_from_yaml"  ]] && TTL_DEFAULT="$ttl_from_yaml"
 
-# Политики и дефолты
-SPF_POLICY="${SPF_POLICY:-warn}"   # warn|append
-TTL_DEFAULT="${TTL_DEFAULT:-3600}"
+[[ -n "$DOMAIN"   ]] || { ERR "domain не задан в $VARS_FILE"; exit 1; }
+[[ -n "$HOSTNAME" ]] || { ERR "hostname не задан в $VARS_FILE"; exit 1; }
+[[ -n "$IPV4"     ]] || { ERR "ipv4 не задан в $VARS_FILE"; exit 1; }
 
-# Пути к state
-MSA_STATE_DIR="${MSA_STATE_DIR:-/var/local/msa}"
-MSA_MANIFEST="${MSA_MANIFEST:-$MSA_STATE_DIR/manifest.json}"
-MSA_DKIM_TXT="${MSA_DKIM_TXT:-$MSA_STATE_DIR/dkim.txt}"
-
-# ========= ВСПОМОГАТЕЛЬНЫЕ =========
-trimdot(){ local s="${1:-}"; echo "${s%.}"; }
-
-# Безопасное чтение из JSON-файла (если файла нет — пусто)
-jq_safe_file(){ local file="$1" filter="$2"; [[ -f "$file" ]] || { echo ""; return 0; }; jq -r "${filter} // empty" "$file" 2>/dev/null || true; }
-manifest_get(){ jq_safe_file "$MSA_MANIFEST" "$1"; }
-
-# Нормализация имён
 APEX_FQDN="$(trimdot "$DOMAIN")"
 MAIL_FQDN="$(trimdot "$HOSTNAME")"
 
@@ -97,218 +95,213 @@ DKIM_SELECTOR="$(manifest_get '.dns.selector')"; [[ -z "$DKIM_SELECTOR" ]] && DK
 DKIM_FQDN="$(trimdot "${DKIM_SELECTOR}._domainkey.$DOMAIN")"
 DMARC_FQDN="$(trimdot "_dmarc.$DOMAIN")"
 
-# DKIM значение (если модуль 05 уже положил)
 DKIM_VALUE=""
-[[ -f "$MSA_DKIM_TXT" ]] && DKIM_VALUE="$(tr -d '\n' < "$MSA_DKIM_TXT")"
-
-# DMARC дефолт + опциональный оверрайд из manifest.json
+if [[ -f "$MSA_DKIM_TXT" ]]; then
+  DKIM_VALUE="$(tr -d '\n' <"$MSA_DKIM_TXT" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+fi
 DMARC_VALUE_DEFAULT="v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN%.}"
-dm="$(manifest_get '.dns.DMARC')"
-[[ -n "$dm" ]] && DMARC_VALUE_DEFAULT="$dm"
+dm_yaml="$(manifest_get '.dns.DMARC')"
+[[ -n "$dm_yaml" ]] && DMARC_VALUE_DEFAULT="$dm_yaml"
 
 INFO "Конфиг: domain=$APEX_FQDN, hostname=$MAIL_FQDN, ipv4=$IPV4, SPF_POLICY=$SPF_POLICY, TTL=$TTL_DEFAULT"
-$DNS_DRY_RUN && INFO "Режим: DRY-RUN"
+[[ "$DNS_DRY_RUN" == "true" ]] && INFO "Режим: DRY-RUN"
 
-# ========= ПРОВЕРКА NS =========
+# ====== NS ПРОВЕРКА ======
 ns_list="$(dig NS +short "$APEX_FQDN" | sed 's/\.$//')"
 if [[ -z "$ns_list" ]]; then
-  WARN "NS для $APEX_FQDN не получены — авто-DNS пропущен."
+  WARN "NS для $APEX_FQDN не получены — пропускаю авто-DNS."
   exit 0
 fi
 if ! echo "$ns_list" | grep -qi 'beget'; then
-  WARN "Домен $APEX_FQDN делегирован НЕ на Beget: $(echo "$ns_list" | tr '\n' ' ' | sed 's/ $//')"
+  WARN "Домен $APEX_FQDN делегирован НЕ на Beget:"
+  echo "$ns_list" | sed 's/^/  - /'
   INFO "Пропускаю авто-DNS. Добавьте записи вручную."
   exit 0
 fi
 INFO "NS у $APEX_FQDN — Beget:"
 echo "$ns_list" | sed 's/^/  - /'
 
-# ========= Beget API =========
-beget_auth_args(){
-  [[ -n "$BEGET_LOGIN" ]] || { ERR "Для работы с Beget нужен .beget.login в vars.yaml"; exit 1; }
-  if [[ -n "$BEGET_TOKEN" ]]; then
-    printf "%s" \
-      "-d" "login=$BEGET_LOGIN" \
-      "-d" "token=$BEGET_TOKEN"
-  elif [[ -n "$BEGET_PASSWORD" ]]; then
-    printf "%s" \
-      "-d" "login=$BEGET_LOGIN" \
-      "-d" "passwd=$BEGET_PASSWORD"
+# ====== CREDs ======
+BEGET_HAS_CREDS=true
+if [[ -z "$BEGET_LOGIN" || -z "$BEGET_PASSWORD" ]]; then
+  BEGET_HAS_CREDS=false
+  if [[ "$DNS_DRY_RUN" == "true" ]]; then
+    WARN "Beget API креды не заданы (vars.yaml: beget.login / beget.password). API-запросы пропущу."
   else
-    ERR "В vars.yaml не задан ни .beget.token, ни .beget.password — не могу авторизоваться в Beget"
+    ERR "Для применения изменений нужны beget.login / beget.password в $VARS_FILE"
     exit 1
   fi
-}
+fi
 
+# ====== Beget API ======
 beget_api_post(){
   local path="$1" json="$2"
-  curl -fsS --connect-timeout 15 --max-time 45 \
-    -X POST "https://api.beget.com/api/dns/$path" \
-    $(beget_auth_args) \
-    -d "input_format=json" \
-    -d "output_format=json" \
+  local curl_opts=(
+    -fsS
+    --connect-timeout 15
+    --max-time 45
+    --retry 1
+    --retry-connrefused
+    -X POST "https://api.beget.com/api/dns/$path"
+    -d "login=$BEGET_LOGIN"
+    -d "passwd=$BEGET_PASSWORD"
+    -d "input_format=json"
+    -d "output_format=json"
     --data-urlencode "input_data=$json"
+  )
+  if [[ "${BEGET_DEBUG:-0}" == "1" ]]; then
+    >&2 echo "DEBUG beget $path input: $json"
+  fi
+  curl "${curl_opts[@]}"
 }
-
-api_ok(){
-  jq -e '.status=="success" and ((.answer.status//"success")=="success")' >/dev/null 2>&1
-}
-api_errmsg(){
-  jq -r '.answer.errors? // .error? // .answer.error_text? // .error_text? // .result.message? // "unknown error"' 2>/dev/null
-}
-
-dns_get(){
-  local fqdn="$1"
-  beget_api_post "getData" "$(jq -c --null-input --arg f "$fqdn" '{fqdn:$f}')"
+api_ok(){ jq -e '.status=="success" and ((.answer.status//"success")=="success")' >/dev/null 2>&1; }
+api_errmsg(){ jq -r '.answer.errors? // .error? // .answer.error_text? // .error_text? // .result.message? // "unknown error"' 2>/dev/null; }
+dns_get_apex(){
+  $BEGET_HAS_CREDS || { echo "{}"; return 0; }
+  beget_api_post "getData" "$(jq -nc --arg f "$APEX_FQDN" '{fqdn:$f}')" || echo "{}"
 }
 dns_change(){
-  local fqdn="$1" records_json="$2"
-  beget_api_post "changeRecords" "$(jq -c --arg f "$fqdn" --argjson r "$records_json" '{fqdn:$f,records:$r}')"
+  local fqdn="$1" payload_json="$2"
+  $BEGET_HAS_CREDS || { echo '{"skip":"no-creds"}'; return 0; }
+  local wrapper; wrapper="$(jq -nc --arg f "$fqdn" --arg p "$payload_json" '{fqdn:$f,records:($p|fromjson)}' 2>/dev/null || echo '')"
+  [[ -n "$wrapper" ]] || { echo '{"status":"error","error_text":"bad payload json"}'; return 0; }
+  beget_api_post "changeRecords" "$wrapper" || { echo '{"status":"error","error_text":"curl failed"}'; return 0; }
 }
 
-# ========= РАБОТА С ЗАПИСЯМИ =========
-sanitize_records(){
-  jq -c 'if . == null then {} else
-           with_entries(select(.key|IN("A","AAAA","CNAME","MX","TXT","SRV","CAA")))
-         end'
-}
+# ====== ЧИТАЕМ ТЕКУЩИЙ APEX ======
+INFO "Читаю всю зону (APEX) через getData…"
+apex_raw="$(dns_get_apex)"
+if [[ -z "$apex_raw" ]]; then
+  ERR "Пустой ответ от API getData(Apex)"
+  exit 1
+fi
+if ! echo "$apex_raw" | api_ok >/dev/null 2>&1; then
+  ERR "Beget API error: $(echo "$apex_raw" | api_errmsg)"
+  exit 1
+fi
 
-# Вернуть первый SPF (чистый текст) либо пусто
-extract_spf(){
-  jq -r '(.TXT // []) | map(.value // .txtdata) | map(sub("^\"|\"$";"")) | map(select(test("^\\s*v=spf1\\b"; "i"))) | .[0] // empty'
-}
+# Текущие apex A/MX/TXT (как массивы строк)
+apex_A="$(echo "$apex_raw" | jq -r '.answer.result.records.A[]?   | (.value // .address)    ' 2>/dev/null || true)"
+apex_MX="$(echo "$apex_raw" | jq -r '.answer.result.records.MX[]?  | if .value then .value else ((.priority // .preference // 10|tostring)+" "+(.exchange // "")) end ' 2>/dev/null || true)"
+apex_TXT="$(echo "$apex_raw" | jq -r '.answer.result.records.TXT[]?| (.value // .txtdata)  ' 2>/dev/null || true)"
 
-# Добавить/обновить SPF с политикой warn|append
-update_spf(){
-  local recset="$1" policy="$2" host="$3" ttl="$4"
-  local cur_spf new_spf
-  cur_spf="$(echo "$recset" | extract_spf || true)"
-
-  # policy=warn — если SPF уже есть, не трогаем
-  if [[ "$policy" == "warn" && -n "$cur_spf" ]]; then
-    echo "$recset"
-    return
-  fi
-
-  if [[ -z "$cur_spf" ]]; then
-    new_spf="v=spf1 mx a:${host} ~all"
+# Вытащим существующий SPF (если есть)
+cur_spf="$(printf '%s\n' "$apex_TXT" | awk 'BEGIN{IGNORECASE=1} /^ *"?.*v=spf1/ {print; exit}')"
+merge_spf() {
+  local spf="$1" host="$2"
+  if [[ -z "$spf" ]]; then echo "v=spf1 mx a:${host} ~all"; return; fi
+  if grep -qiE "(^|[[:space:]])a:${host}([[:space:]]|$)" <<<"$spf"; then echo "$spf"; return; fi
+  if grep -qiE '[[:space:]][~\-\?+]?all([[:space:]]|$)' <<<"$spf"; then
+    sed -E "s/[[:space:]]([~\\-\\?\\+]?all)([[:space:]]|$)/ a:${host} \\1\\2/I" <<<"$spf"
   else
-    new_spf="$cur_spf"
-    if ! grep -qiE "(^|[[:space:]])a:${host}([[:space:]]|$)" <<<"$new_spf"; then
-      if grep -qiE '[[:space:]][~\-\?+]?all([[:space:]]|$)' <<<"$new_spf"; then
-        new_spf="$(sed -E "s/[[:space:]]([~\\-\\?\\+]?all)([[:space:]]|$)/ a:${host} \\1\\2/I" <<<"$new_spf")"
-      else
-        new_spf="$new_spf a:${host}"
-      fi
-    fi
-  fi
-
-  jq -c --arg v "$new_spf" --argjson t "$ttl" '
-    .TXT = ((.TXT // []) | map(select((.value // .txtdata) | test("^\\s*v=spf1\\b"; "i") | not)) + [{value:$v,ttl:$t}])
-  ' <<<"$recset"
-}
-
-build_mail_recset(){
-  local cur="$1" ip="$2" ttl="$3"
-  jq -c --arg ip "$ip" --argjson t "$ttl" '
-    .A = [{value:$ip, ttl:$t}] | del(.CNAME)
-  ' <<<"$cur"
-}
-
-build_apex_recset(){
-  local cur="$1" mailfq="$2" ttl="$3" spfpol="$4"
-  local mxv="10 ${mailfq}."
-  cur="$(jq -c --arg v "$mxv" --argjson t "$ttl" '.MX = [{value:$v, ttl:$t}]' <<<"$cur")"
-  cur="$(update_spf "$cur" "$spfpol" "$mailfq" "$ttl")"
-  echo "$cur"
-}
-
-build_dkim_recset(){
-  local cur="$1" dkim="$2" ttl="$3"
-  jq -c --arg v "$dkim" --argjson t "$ttl" '.TXT = [{value:$v, ttl:$t}]' <<<"$cur"
-}
-
-build_dmarc_recset(){
-  local cur="$1" dmarc="$2" ttl="$3"
-  # добавляем только если TXT нет вовсе
-  if [[ "$(jq -r '.TXT | length // 0' <<<"$cur")" -gt 0 ]]; then
-    echo "$cur"
-  else
-    jq -c --arg v "$dmarc" --argjson t "$ttl" '.TXT = [{value:$v, ttl:$t}]' <<<"$cur"
+    echo "$spf a:${host}"
   fi
 }
 
-read_recset(){
-  local fqdn="$1" resp recs
-  resp="$(dns_get "$fqdn" || true)"
-  if [[ -z "$resp" ]]; then echo "{}"; return; fi
-  if echo "$resp" | api_ok; then
-    recs="$(echo "$resp" | jq -c '.answer.result.records // {}' | sanitize_records)"
-    [[ -z "$recs" ]] && echo "{}" || echo "$recs"
-  else
-    # FQDN может ещё не существовать — пусто ок
-    echo "{}"
-  fi
+# Итоговый SPF (в кавычках API не требует; передаём голую строку)
+if [[ "$SPF_POLICY" == "warn" && -n "${cur_spf:-}" ]]; then
+  want_spf="$cur_spf"
+else
+  want_spf="$(merge_spf "${cur_spf:-}" "$MAIL_FQDN")"
+fi
+
+# ====== УТИЛИТА: формирование payload {priority,value} ======
+# На вход — newline-списки значений (можно пустые). Возврат — JSON-объект с ключами, где массивы не пустые.
+mk_payload(){
+  local a_lines="$1" mx_lines="$2" txt_lines="$3"
+  local ja jmx jtxt
+  ja="$(printf '%s\n' "$a_lines"  | jq -Rsc 'split("\n")|map(select(length>0))')"
+  jmx="$(printf '%s\n' "$mx_lines" | jq -Rsc 'split("\n")|map(select(length>0))')"
+  jtxt="$(printf '%s\n' "$txt_lines"| jq -Rsc 'split("\n")|map(select(length>0))')"
+  jq -nc --argjson A "$ja" --argjson MX "$jmx" --argjson TXT "$jtxt" '
+    {}
+    | (if ($A|length)>0  then .A  = [ range(0; $A|length)  as $i | {priority:(($i+1)*10), value: $A[$i]} ]  else . end)
+    | (if ($MX|length)>0 then .MX = [ range(0; $MX|length) as $i |
+                                       ($MX[$i] | capture("^(?<p>[0-9]+)\\s+(?<h>.+)$")) as $m
+                                       | {priority: ($m.p|tonumber), value: ($m.h|sub("\\.$";""))}
+                                     ] else . end)
+    | (if ($TXT|length)>0 then .TXT= [ range(0; $TXT|length)as $i | {priority:(($i+1)*10), value: $TXT[$i]} ] else . end)
+  '
 }
 
-apply_recset(){
-  local fqdn="$1" before="$2" after="$3"
-  local b_norm a_norm
-  b_norm="$(jq -S <<<"$before")"
-  a_norm="$(jq -S <<<"$after")"
+# ====== DESIRED ======
+# mail.<domain>: только A
+payload_mail="$(mk_payload "$IPV4" "" "")"
 
-  if [[ "$b_norm" == "$a_norm" ]]; then
-    INFO "[$fqdn] изменений нет"
+# apex: бережно — A оставляем как есть (из текущих), MX ставим на mail.<domain>, SPF — по policy
+apex_A_lines="$(printf '%s\n' "$apex_A" | sed '/^$/d')"
+apex_MX_want="10 $MAIL_FQDN"
+payload_apex="$(mk_payload "$apex_A_lines" "$apex_MX_want" "$want_spf")"
+
+# DKIM (если ключ сгенерен)
+payload_dkim="{}"
+if [[ -n "$DKIM_VALUE" ]]; then
+  payload_dkim="$(mk_payload "" "" "$DKIM_VALUE")"
+else
+  WARN "DKIM-файл не найден ($MSA_DKIM_TXT) — пропускаю DKIM."
+fi
+
+# DMARC: по умолчанию — если отсутствует в DNS (бережно), либо force
+need_dmarc=true
+if [[ "$DMARC_MODE" == "ifabsent" ]]; then
+  # Проверим через публичный DNS (API не даёт поддоменов до создания)
+  if dig +short TXT "$DMARC_FQDN" | grep -qi 'v=DMARC1'; then
+    need_dmarc=false
+    INFO "DMARC уже существует в DNS — пропускаю (режим ifabsent)."
+  fi
+fi
+payload_dmarc="{}"
+$need_dmarc && payload_dmarc="$(mk_payload "" "" "$DMARC_VALUE_DEFAULT")"
+
+# ====== APPLY ======
+apply_one(){
+  local fqdn="$1" payload="$2"
+  # Пустой объект — нечего делать (например, нет DKIM/DMARC в выбранном режиме)
+  if [[ -z "${payload//[[:space:]]/}" || "$payload" = "{}" ]]; then
+    INFO "[$fqdn] изменений нет (payload пуст)"
     return 0
   fi
 
   if [[ "$DNS_DRY_RUN" == "true" ]]; then
-    INFO "[$fqdn] DRY-RUN: изменения:"
-    diff -u <(echo "$b_norm") <(echo "$a_norm") || true
+    INFO "[$fqdn] DRY-RUN: payload →"
+    echo "$payload" | jq -S .
     return 0
   fi
 
+  [[ "${BEGET_DEBUG:-0}" == "1" ]] && { >&2 echo "DEBUG desired($fqdn):"; echo "$payload" | jq -S . >&2; }
+
   INFO "[$fqdn] changeRecords…"
-  local resp; resp="$(dns_change "$fqdn" "$after" || true)"
-  if [[ -z "$resp" ]] || ! echo "$resp" | api_ok; then
+  local resp; resp="$(dns_change "$fqdn" "$payload" || true)"
+  if [[ -z "$resp" ]]; then
+    ERR "[$fqdn] пустой ответ от API"
+    exit 1
+  fi
+  if ! echo "$resp" | api_ok >/dev/null 2>&1; then
+    [[ "${BEGET_DEBUG:-0}" == "1" ]] && { >&2 echo "DEBUG changeRecords($fqdn) resp:"; echo "$resp" | jq -S . >&2; }
     ERR "[$fqdn] ошибка changeRecords: $(echo "$resp" | api_errmsg)"
     exit 1
   fi
 }
 
-verify_api_has(){
-  local fqdn="$1" jq_filter="$2"
-  local r; r="$(dns_get "$fqdn" || true)"
-  [[ -n "$r" ]] && echo "$r" | api_ok && echo "$r" | jq -e "$jq_filter" >/dev/null 2>&1
+INFO "Готовлю изменения…"
+apply_one "$MAIL_FQDN"  "$payload_mail"
+apply_one "$APEX_FQDN"  "$payload_apex"
+[[ -n "$DKIM_VALUE" ]] && apply_one "$DKIM_FQDN" "$payload_dkim"
+$need_dmarc && apply_one "$DMARC_FQDN" "$payload_dmarc"
+
+# ====== ВЕРИФИКАЦИЯ (через dig) ======
+INFO "Верификация через публичный DNS… (может занять время из-за кешей)"
+verify_a(){ local host="$1" ip="$2"; dig +short A "$host" | grep -Fxq "$ip" && echo ok || echo fail; }
+verify_mx_spf(){
+  local apex="$1" mailfq="$2"
+  local mx_ok spf_ok
+  mx_ok=fail
+  if dig +short MX "$apex" | sed 's/\.$//' | grep -Eq "^[[:space:]]*10[[:space:]]+$mailfq$"; then mx_ok=ok; fi
+  spf_ok=fail
+  if dig +short TXT "$apex" | tr -d '"' | grep -qi '^v=spf1'; then spf_ok=ok; fi
+  [[ "$mx_ok" == "ok" && "$spf_ok" == "ok" ]] && echo ok || echo fail
 }
-
-# ========= ПЛАН / ПРИМЕНЕНИЕ =========
-INFO "Читаю текущие записи…"
-cur_mail="$(read_recset "$MAIL_FQDN")"
-cur_apex="$(read_recset "$APEX_FQDN")"
-cur_dkim="$(read_recset "$DKIM_FQDN")"
-cur_dmarc="$(read_recset "$DMARC_FQDN")"
-
-new_mail="$(build_mail_recset  "$cur_mail"  "$IPV4"                   "$TTL_DEFAULT")"
-new_apex="$(build_apex_recset  "$cur_apex"  "$MAIL_FQDN"              "$TTL_DEFAULT" "$SPF_POLICY")"
-if [[ -n "$DKIM_VALUE" ]]; then
-  new_dkim="$(build_dkim_recset "$cur_dkim" "$DKIM_VALUE"             "$TTL_DEFAULT")"
-else
-  new_dkim="$cur_dkim"
-  WARN "DKIM-файл не найден ($MSA_DKIM_TXT) — пропускаю DKIM."
-fi
-new_dmarc="$(build_dmarc_recset "$cur_dmarc" "$DMARC_VALUE_DEFAULT"   "$TTL_DEFAULT")"
-
-apply_recset "$MAIL_FQDN"  "$cur_mail"  "$new_mail"
-apply_recset "$APEX_FQDN"  "$cur_apex"  "$new_apex"
-[[ -n "$DKIM_VALUE" ]] && apply_recset "$DKIM_FQDN" "$cur_dkim" "$new_dkim"
-apply_recset "$DMARC_FQDN" "$cur_dmarc" "$new_dmarc"
-
-# ========= ВЕРИФИКАЦИЯ =========
-INFO "Верификация после применения…"
-A_ok=false MX_ok=false
-verify_api_has "$MAIL_FQDN"  --arg ip "$IPV4" '.answer.result.records.A[]?  | select((.value // .address) == $ip)' && A_ok=true
-verify_api_has "$APEX_FQDN"  --arg m  "10 ${MAIL_FQDN}." '.answer.result.records.MX[]? | select((.value // (.preference|tostring+" "+.exchange)) == $m)' && MX_ok=true
-INFO "Итог: A(mail)=$A_ok, MX(@)=$MX_ok"
+vA="$(verify_a "$MAIL_FQDN" "$IPV4" || true)"
+vMXSPF="$(verify_mx_spf "$APEX_FQDN" "$MAIL_FQDN" || true)"
+INFO "Итог: A(mail)=$vA, MX/SPF(@)=$vMXSPF"
 INFO "Готово."
-exit 0
