@@ -1,9 +1,40 @@
 #!/usr/bin/env bash
-# Выпуск LE + подключение к Dovecot/Postfix без ломания master.cf
+# Выпуск LE + подключение к Dovecot/Postfix, с обязательной проверкой A-записей.
 # Требует: DOMAIN, HOSTNAME; run_cmd, log_info/log_warn
 
 set -Eeuo pipefail
-: "${DOMAIN:?}" ; : "${HOSTNAME:?}"
+IFS=$'\n\t'
+
+: "${DOMAIN:?}"
+: "${HOSTNAME:?}"
+: "${IPV4:?}"
+
+ssl::_auth_ns() { echo ns1.beget.com ns2.beget.com ns1.beget.ru ns2.beget.ru ns1.beget.pro ns2.beget.pro; }
+
+ssl::wait_a() { # fqdn ip [timeout_sec]
+  local fqdn="$1" ip="$2" timeout="${3:-180}" t=0 ok=0
+
+  # сначала авторитативы Beget
+  while (( t < timeout )); do
+    for ns in $(ssl::_auth_ns); do
+      if dig +short A "$fqdn" @"$ns" | grep -Fxq "$ip"; then ok=1; break; fi
+    done
+    (( ok )) && break
+    sleep 5; t=$((t+5))
+  done
+
+  # затем публичный резолвер (8.8.8.8) — чтобы удостовериться, что кэш догнался
+  if (( ok )); then
+    t=0; ok=0
+    while (( t < timeout )); do
+      if dig +short A "$fqdn" @8.8.8.8 | grep -Fxq "$ip"; then ok=1; break; fi
+      sleep 5; t=$((t+5))
+    done
+  fi
+
+  (( ok )) || return 1
+  return 0
+}
 
 ssl::paths() {
   LE_DIR="/etc/letsencrypt/live/${HOSTNAME}"
@@ -13,10 +44,20 @@ ssl::paths() {
 
 ssl::obtain() {
   ssl::paths
+
+  # 1) Убедимся, что A(hostname) уже на месте — иначе standalone-challenge не пройдёт.
+  log_info "LE: жду A ${HOSTNAME} -> ${IPV4} перед выпуском сертификата…"
+  if ssl::wait_a "${HOSTNAME}" "${IPV4}" 300; then
+    log_info "LE: подтверждено ${HOSTNAME} -> ${IPV4}"
+  else
+    log_warn "LE: не дождался ${HOSTNAME} -> ${IPV4}. Попробую всё равно (вдруг кэш локального резолвера уже знает)."
+  fi
+
   if [[ -r "${LE_FULL}" && -r "${LE_KEY}" ]]; then
     log_info "LE: сертификат для ${HOSTNAME} уже есть — пропуск выпуска"
     return 0
   fi
+
   log_info "LE: запрашиваю сертификат для ${HOSTNAME}"
   run_cmd certbot certonly --standalone --preferred-challenges http \
     --non-interactive --agree-tos --no-eff-email -m "info@${DOMAIN}" -d "${HOSTNAME}"
@@ -83,7 +124,7 @@ ssl::enable_postfix_tls() {
     "smtpd_tls_cert_file=${LE_FULL}" \
     "smtpd_tls_key_file=${LE_KEY}"
 
-  # убедимся, что 587/465 включены (без chroot) и знают путь к ключам
+  # 587/465 без chroot, с теми же ключами (дублирую для наглядности)
   run_cmd postconf -M "submission/inet=submission inet n - n - - smtpd"
   run_cmd postconf -P "submission/inet/smtpd_tls_security_level=encrypt"
   run_cmd postconf -P "submission/inet/smtpd_sasl_auth_enable=yes"
