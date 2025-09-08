@@ -1,111 +1,120 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
 set -euo pipefail
+. "$(dirname "$0")/../lib/common.sh"
 
-. "$(dirname "$0")/../lib/log.sh"
-. "$(dirname "$0")/../lib/yaml.sh"
+dkim::vars() {
+  DOMAIN="$(yq -r '.domain' "$VARS")"
+  SELECTOR="$(yq -r '.dkim_selector // "s1"' "$VARS")"
+  HOSTNAME="$(yq -r '.hostname' "$VARS")"
+  IPV4="$(yq -r '.ipv4' "$VARS")"
+}
 
-DOMAIN="$(yq -r '.domain' "${VARS_FILE}")"
-HOSTNAME="$(yq -r '.hostname' "${VARS_FILE}")"
-IPV4="$(yq -r '.ipv4' "${VARS_FILE}")"
-SELECTOR="$(yq -r '.dkim_selector // "s1"' "${VARS_FILE}")"
+dkim::prepare_dirs() {
+  run install -d -m 0750 -o opendkim -g opendkim "/etc/opendkim/keys/${DOMAIN}"
+  run install -d -m 0750 -o opendkim -g postfix   /var/spool/postfix/opendkim
+}
 
-log::info "OpenDKIM: подготовка (selector=${SELECTOR}, domain=${DOMAIN})"
+dkim::ensure_key() {
+  local priv="/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private"
+  if [[ ! -f "$priv" ]]; then
+    log "OpenDKIM: генерирую ключ 1024 (чтоб TXT не резался)"
+    run opendkim-genkey -b 1024 -s "$SELECTOR" -d "$DOMAIN" -D "/etc/opendkim/keys/${DOMAIN}"
+    run chown opendkim:opendkim "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private" "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt"
+    run chmod 0600 "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private"
+  fi
+}
 
-install -d -m 0750 -o opendkim -g opendkim "/etc/opendkim/keys/${DOMAIN}"
-install -d -m 0750 -o opendkim -g postfix /var/spool/postfix/opendkim
+dkim::write_tables() {
+  # ключевая фиксация: используем file:, а не refile:, и явные соответствия
+  printf '%s\n' \
+    "${SELECTOR}._domainkey.${DOMAIN} ${DOMAIN}:${SELECTOR}:/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private" \
+    | run install -D -m 0644 /dev/stdin /etc/opendkim/KeyTable
 
-# 1024 чтобы TXT не резался
-log::info "OpenDKIM: генерирую ключ 1024 (чтоб TXT не резался)"
-opendkim-genkey -b 1024 -s "${SELECTOR}" -d "${DOMAIN}" -D "/etc/opendkim/keys/${DOMAIN}"
-chown opendkim:opendkim "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private" "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt"
-chmod 0600 "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private"
+  printf '%s\n' \
+    "*@${DOMAIN} ${SELECTOR}._domainkey.${DOMAIN}" \
+    | run install -D -m 0644 /dev/stdin /etc/opendkim/SigningTable
 
-# Таблицы
-install -D -m 0644 /dev/stdin /etc/opendkim/KeyTable <<EOF
-${SELECTOR}._domainkey.${DOMAIN} ${DOMAIN}:${SELECTOR}:/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private
-EOF
+  printf '%s\n' \
+    "127.0.0.1" "localhost" "$HOSTNAME" "$IPV4" \
+    | run install -D -m 0644 /dev/stdin /etc/opendkim/TrustedHosts
 
-# ВАЖНО: используем refile и нормальные regex-ы (.*@domain и @domain только доменный уровень)
-install -D -m 0644 /dev/stdin /etc/opendkim/SigningTable <<'EOF'
-# Любой локал-парт для домена:
-^.*@heavymail\.ru$ s1._domainkey.heavymail.ru
-# fallback (совпадение по доменной части):
-^@heavymail\.ru$    s1._domainkey.heavymail.ru
-EOF
-# ↑ строка с конкретным доменом будет перезаписана ниже шаблоном под ваш DOMAIN
+  run chown opendkim:opendkim /etc/opendkim/{KeyTable,SigningTable,TrustedHosts}
+  run chmod 0644 /etc/opendkim/{KeyTable,SigningTable,TrustedHosts}
+}
 
-# Перегенерим файл под переменные (заменим heavymail.ru на реальный DOMAIN/SELECTOR)
-sed -i "s/heavymail\.ru/${DOMAIN//./\\.}/g; s/s1\\./${SELECTOR}\\./g" /etc/opendkim/SigningTable
-
-# TrustedHosts: localhost + FQDN + IP
-install -D -m 0644 /dev/stdin /etc/opendkim/TrustedHosts <<EOF
-127.0.0.1
-localhost
-${HOSTNAME}
-${IPV4}
-EOF
-
-chown opendkim:opendkim /etc/opendkim/KeyTable /etc/opendkim/SigningTable /etc/opendkim/TrustedHosts
-chmod 0644 /etc/opendkim/KeyTable /etc/opendkim/SigningTable /etc/opendkim/TrustedHosts
-
-# Конфиг OpenDKIM (главное — refile: для SigningTable)
-install -D -m 0644 /dev/stdin /etc/opendkim.conf <<'EOF'
+dkim::write_conf() {
+  # не рушим чужие настройки: перезаписываем только ключевые строки, но конфиг отдаём целиком,
+  # чтобы гарантировать Socket + file:таблицы
+  cat <<'EOF' | run install -D -m 0644 /dev/stdin /etc/opendkim.conf
 Syslog                  yes
 UMask                   002
 Mode                    sv
-Canonicalization        relaxed/simple
-Selector                default
 AutoRestart             yes
-AutoRestartRate         10/1h
-Background              yes
-DNSTimeout              5
-SignatureAlgorithm      rsa-sha256
-
-ExternalIgnoreList      refile:/etc/opendkim/TrustedHosts
-InternalHosts           refile:/etc/opendkim/TrustedHosts
-
-KeyTable                file:/etc/opendkim/KeyTable
-SigningTable            refile:/etc/opendkim/SigningTable
+PidFile                 /run/opendkim/opendkim.pid
 
 Socket                  local:/var/spool/postfix/opendkim/opendkim.sock
-UserID                  opendkim:opendkim
 
+KeyTable                file:/etc/opendkim/KeyTable
+SigningTable            file:/etc/opendkim/SigningTable
+InternalHosts           /etc/opendkim/TrustedHosts
+
+Canonicalization        relaxed/simple
+MinimumKeyBits          1024
+Selector                default
 OversignHeaders         From
+TrustAnchorFile         /usr/share/dns/root.key
 EOF
+}
 
-# systemd override — чтобы сокет был доступен Postfix
-install -d -m 0755 /etc/systemd/system/opendkim.service.d
-install -m 0644 /dev/stdin /etc/systemd/system/opendkim.service.d/override.conf <<'EOF'
+dkim::systemd_override() {
+  run install -d -m 0755 /etc/systemd/system/opendkim.service.d
+  cat <<'EOF' | run install -m 0644 /dev/stdin /etc/systemd/system/opendkim.service.d/override.conf
 [Service]
-ExecStart=
-ExecStart=/usr/sbin/opendkim -x /etc/opendkim.conf -P /run/opendkim/opendkim.pid
+User=opendkim
+Group=opendkim
+ReadWritePaths=/var/spool/postfix/opendkim
 EOF
+  run systemctl daemon-reload
+}
 
-systemctl daemon-reload
-systemctl enable --now opendkim
-systemctl restart opendkim
-
-# Подключаем milter-ы в Postfix (оставим объединённую строку, чтобы не терять opendmarc, если он уже будет)
-postconf -e "milter_default_action=accept"
-postconf -e "milter_protocol=6"
-
-# гарантируем наличие opendkim в списке (без задвоения)
-current_sm="/var/tmp/.postfix.sm.$$"
-postconf -h smtpd_milters >"${current_sm}" || true
-if ! grep -q 'opendkim' "${current_sm}" 2>/dev/null; then
-  if [[ -s "${current_sm}" ]]; then
-    postconf -e "smtpd_milters=$(cat "${current_sm}"),unix:/var/spool/postfix/opendkim/opendkim.sock"
-    postconf -e "non_smtpd_milters=$(postconf -h non_smtpd_milters),unix:/var/spool/postfix/opendkim/opendkim.sock"
-  else
-    postconf -e "smtpd_milters=unix:/var/spool/postfix/opendkim/opendkim.sock"
-    postconf -e "non_smtpd_milters=unix:/var/spool/postfix/opendkim/opendkim.sock"
+dkim::wire_postfix() {
+  # вплетаем milter к существующим (idempotent)
+  local have; have="$(postconf -h smtpd_milters || true)"
+  if [[ -z "${have// }" ]]; then
+    run postconf -e "smtpd_milters=unix:/var/spool/postfix/opendkim/opendkim.sock"
+  elif ! grep -q 'opendkim\.sock' <<<"$have"; then
+    run postconf -e "smtpd_milters=${have},unix:/var/spool/postfix/opendkim/opendkim.sock"
   fi
-fi
-rm -f "${current_sm}"
+  run postconf -e "non_smtpd_milters=$(postconf -h smtpd_milters)"
+  run postconf -e "milter_protocol=6"
+  run postconf -e "milter_default_action=accept"
 
-systemctl reload postfix || systemctl restart postfix
+  # чтобы исходящие через submission/smtps шли как ORIGINATING
+  run postconf -P submission/inet/milter_macro_daemon_name=ORIGINATING
+  run postconf -P smtps/inet/milter_macro_daemon_name=ORIGINATING
+  run systemctl reload postfix
+}
 
-# Экспорт TXT для 09_beget_dns.sh
-install -d -m 0755 /var/local/msa
-cat "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" >/var/local/msa/dkim.txt
-log::info "OpenDKIM: TXT экспортирован в /var/local/msa/dkim.txt"
+dkim::restart_and_export_txt() {
+  run systemctl enable --now opendkim
+  run systemctl restart opendkim
+
+  run install -d -m 0755 /var/local/msa
+  run install -m 0644 "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" /var/local/msa/dkim.txt
+  log "OpenDKIM: TXT экспортирован в /var/local/msa/dkim.txt"
+}
+
+module::main() {
+  dkim::vars
+  log "OpenDKIM: настройка (selector=${SELECTOR}, domain=${DOMAIN})"
+  dkim::prepare_dirs
+  dkim::ensure_key
+  dkim::write_tables
+  dkim::write_conf
+  dkim::systemd_override
+  dkim::wire_postfix
+  dkim::restart_and_export_txt
+}
+
+module::main "$@"
