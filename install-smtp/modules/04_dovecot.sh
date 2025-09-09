@@ -69,13 +69,11 @@ EOF
 }
 
 dovecot::ensure_mail_location() {
-  if ! doveconf -n 2>/dev/null | grep -q '^mail_location ='; then
-    log_info "Dovecot: задаю mail_location (Maildir)"
-    cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-maildir.conf
+  log_info "Dovecot: задаю mail_location (Maildir) через 90-msa-maildir.conf"
+  cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-maildir.conf
 mail_location = maildir:/var/vmail/%d/%n/Maildir
 protocols = imap lmtp sieve pop3
 EOF
-  fi
 }
 
 dovecot::init_maildirs_and_inbox() {

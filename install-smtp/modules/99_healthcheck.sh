@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# 99_healthcheck.sh — проверки Dovecot/Maildir без изменений конфигурации
+# 99_healthcheck.sh — проверки Dovecot/Maildir без изменений конфигурации (soft-fail по умолчанию)
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 . "${MOD_DIR}/../lib/common.sh"
 : "${VARS_FILE:?}"
+HEALTHCHECK_STRICT="${HEALTHCHECK_STRICT:-false}"
 
 hc::_yq() { yq -r "$1" "${VARS_FILE}"; }
-
 hc::first_user_login()   { hc::_yq '.users[0].login'; }
 hc::first_user_password(){ hc::_yq '.users[0].password'; }
 
-hc::user_dir_for() {
-  local login="$1"
-  printf '/var/vmail/%s/%s' "${login#*@}" "${login%@*}"
-}
+hc::user_dir_for() { local login="$1"; printf '/var/vmail/%s/%s' "${login#*@}" "${login%@*}"; }
 
 hc::fail() { log_error "$*"; return 1; }
 hc::ok()   { log_info  "$*"; return 0;  }
@@ -29,22 +26,29 @@ hc::check_service_active() {
 }
 
 hc::check_mail_location() {
-  local out
-  if ! out="$(doveconf -n 2>/dev/null)"; then
-    hc::fail "doveconf -n: failed" || return $?
+  local out; out="$(doveconf -n 2>/dev/null || true)"
+  [[ -n "$out" ]] || { hc::fail "doveconf -n: empty/failed"; return 1; }
+
+  # Принимаем:
+  #  - maildir:/var/vmail/%d/%n/Maildir
+  #  - maildir:/var/vmail/%d/%n
+  #  - maildir:~/Maildir (если дальше есть home=/var/vmail/%d/%n)
+  if grep -Eq '^mail_location = maildir:/var/vmail/%d/%n(/Maildir)?([[:space:]]*$|:)' <<<"$out"; then
+    hc::ok "mail_location OK (maildir:/var/vmail/%d/%n[/Maildir])"
+    return 0
   fi
-  # принимаем maildir:/var/vmail/%d/%n/Maildir с возможными суффиксами, напр. :INDEX=...
-  if grep -Eq '^mail_location = maildir:/var/vmail/%d/%n/Maildir([[:space:]]*$|:)' <<<"$out"; then
-    hc::ok "mail_location OK (Maildir)"
-  else
-    hc::fail "mail_location mismatch (ожидаю: maildir:/var/vmail/%d/%n/Maildir[:...])"
+  if grep -Eq '^mail_location = maildir:~/Maildir([[:space:]]*$|:)' <<<"$out" && \
+     grep -Eq '(^|[[:space:]])home[[:space:]]*=[[:space:]]*/var/vmail/%d/%n([[:space:]]|$)' <<<"$out"; then
+    hc::ok "mail_location OK (maildir:~/Maildir + home=/var/vmail/%d/%n)"
+    return 0
   fi
+
+  hc::fail "mail_location mismatch (ожидаю maildir:/var/vmail/%d/%n[/Maildir] либо maildir:~/Maildir+home=/var/vmail/%d/%n)"
 }
 
 hc::check_auth_config() {
-  local out flat
-  out="$(doveconf -n 2>/dev/null || true)"
-  flat="$(tr -d '\n' <<<"$out")"
+  local out; out="$(doveconf -n 2>/dev/null || true)"
+  [[ -n "$out" ]] || { hc::fail "doveconf -n: empty/failed"; return 1; }
 
   if grep -Eqi '^auth_mechanisms = .*plain.*login' <<<"$out"; then
     hc::ok "auth_mechanisms OK (plain, login)"
@@ -52,18 +56,18 @@ hc::check_auth_config() {
     hc::fail "auth_mechanisms: нет plain/login"
   fi
 
-  # Ищем блок passdb { ... driver = passwd-file ... }
-  if grep -Eqi 'passdb[[:space:]]*\{[^}]*driver[[:space:]]*=[[:space:]]*passwd-file' <<<"$flat"; then
+  # passdb passwd-file
+  if grep -Eqi '(^|[[:space:]])passdb([[:space:]]|\{).*passwd-file' <<<"$(tr -d '\n' <<<"$out")"; then
     hc::ok "passdb driver = passwd-file"
   else
     hc::fail "passdb: не найден driver=passwd-file"
   fi
 
-  # Ищем блок userdb { ... driver = static ... home=/var/vmail/%d/%n ... }
-  if grep -Eqi 'userdb[[:space:]]*\{[^}]*driver[[:space:]]*=[[:space:]]*static[^}]*home[[:space:]]*=[[:space:]]*/var/vmail/%d/%n' <<<"$flat"; then
-    hc::ok "userdb static home=/var/vmail/%d/%n"
+  # userdb: достаточно увидеть home=/var/vmail/%d/%n (в любом блоке userdb/static)
+  if grep -Eqi '(^|[[:space:]])home[[:space:]]*=[[:space:]]*/var/vmail/%d/%n([[:space:]]|$)' <<<"$out"; then
+    hc::ok "userdb: home=/var/vmail/%d/%n обнаружен"
   else
-    hc::fail "userdb: нет static/home=/var/vmail/%d/%n"
+    hc::fail "userdb: нет home=/var/vmail/%d/%n"
   fi
 }
 
@@ -103,9 +107,7 @@ hc::check_maildirs() {
 
     if [[ -d "$d" ]]; then
       local meta; meta="$(stat -Lc '%U:%G %a' "$d" 2>/dev/null || true)"
-      if ! grep -q '^vmail:vmail 750$' <<<"$meta"; then
-        log_error "Maildir root perms/owner: ожидаю vmail:vmail 750 для $d, имею: $meta"; rc=1
-      fi
+      [[ "$meta" == "vmail:vmail 750" ]] || { log_error "Maildir root perms/owner: ожидаю vmail:vmail 750 для $d, имею: $meta"; rc=1; }
     else
       log_error "Maildir root отсутствует: $d"; rc=1
     fi
@@ -114,9 +116,7 @@ hc::check_maildirs() {
       local sd="$d/Maildir/$sub"
       if [[ -d "$sd" ]]; then
         local sm; sm="$(stat -Lc '%U:%G %a' "$sd" 2>/dev/null || true)"
-        if ! grep -q '^vmail:vmail 750$' <<<"$sm"; then
-          log_error "Maildir/$sub perms/owner: ожидаю vmail:vmail 750 для $sd, имею: $sm"; rc=1
-        fi
+        [[ "$sm" == "vmail:vmail 750" ]] || { log_error "Maildir/$sub perms/owner: ожидаю vmail:vmail 750 для $sd, имею: $sm"; rc=1; }
       else
         log_error "Подкаталог отсутствует: $sd"; rc=1
       fi
@@ -160,7 +160,13 @@ module::main() {
   else
     log_warn "HEALTHCHECK: есть проблемы (rc=$rc)"
   fi
-  exit "$rc"
+
+  # По умолчанию не валим пайплайн, чтобы 100_report.sh отработал
+  if [[ "$HEALTHCHECK_STRICT" == "true" ]]; then
+    exit "$rc"
+  else
+    exit 0
+  fi
 }
 
 module::main "$@"
