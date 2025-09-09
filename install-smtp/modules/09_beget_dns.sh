@@ -153,7 +153,8 @@ dns::build_desired() {
 
   # apex = A + MX + SPF
   APEX_MX_WANT="10 $MAIL_FQDN"
-  PAYLOAD_APEX="$(dns::mk_payload "$CUR_A" "$APEX_MX_WANT" "$WANT_SPF")"
+  PAYLOAD_APEX="$(dns::mk_payload "" "$APEX_MX_WANT" "$WANT_SPF")"  # A(@) оставляем как есть
+  # ВАЖНО: A(@) не меняем здесь — этим занимается 02_pre_dns.sh. Тут только MX/SPF/и пр.
 
   # mail.<domain> = A + MX + SPF
   MAIL_MX_WANT="10 $MAIL_FQDN"
@@ -188,7 +189,8 @@ module::main() {
   dns::vars
   dns::cleanup_beget_defaults
   APEX_RAW="$(dns::get_apex)"
-  CUR_A="$(jq -r '.answer.result.records.A[]?.value' <<<"$APEX_RAW" 2>/dev/null || true)"
+  CUR_A="$(jq -r '.answer.result.records.A[]? | select(.value != null) | .value' <<<"$APEX_RAW" 2>/dev/null \
+          | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)"
   CUR_SPF="$(jq -r '.answer.result.records.TXT[]? | select(test("^\\\"?v=spf1";"i"))' <<<"$APEX_RAW" 2>/dev/null || true)"
   dns::build_desired
   dns::apply_all

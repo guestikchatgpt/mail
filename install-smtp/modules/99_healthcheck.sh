@@ -13,7 +13,6 @@ hc::first_user_login()   { hc::_yq '.users[0].login'; }
 hc::first_user_password(){ hc::_yq '.users[0].password'; }
 
 hc::user_dir_for() {
-  # login → /var/vmail/<domain>/<user>
   local login="$1"
   printf '/var/vmail/%s/%s' "${login#*@}" "${login%@*}"
 }
@@ -34,11 +33,11 @@ hc::check_mail_location() {
   if ! out="$(doveconf -n 2>/dev/null)"; then
     hc::fail "doveconf -n: failed" || return $?
   fi
-
-  if grep -qE '^mail_location = maildir:/var/vmail/%d/%n/Maildir$' <<<"$out"; then
+  # принимаем maildir:/var/vmail/%d/%n/Maildir с возможными суффиксами, напр. :INDEX=...
+  if grep -Eq '^mail_location = maildir:/var/vmail/%d/%n/Maildir([[:space:]]*$|:)' <<<"$out"; then
     hc::ok "mail_location OK (Maildir)"
   else
-    hc::fail "mail_location mismatch (ожидаю: maildir:/var/vmail/%d/%n/Maildir)"
+    hc::fail "mail_location mismatch (ожидаю: maildir:/var/vmail/%d/%n/Maildir[:...])"
   fi
 }
 
@@ -47,20 +46,21 @@ hc::check_auth_config() {
   out="$(doveconf -n 2>/dev/null || true)"
   flat="$(tr -d '\n' <<<"$out")"
 
-  if grep -qiE '^auth_mechanisms = .*plain.*login' <<<"$out"; then
+  if grep -Eqi '^auth_mechanisms = .*plain.*login' <<<"$out"; then
     hc::ok "auth_mechanisms OK (plain, login)"
   else
     hc::fail "auth_mechanisms: нет plain/login"
   fi
 
-  if grep -qi 'passdb[^{]*\{[^}]*driver *= *passwd-file' <<<"$flat"; then
+  # Ищем блок passdb { ... driver = passwd-file ... }
+  if grep -Eqi 'passdb[[:space:]]*\{[^}]*driver[[:space:]]*=[[:space:]]*passwd-file' <<<"$flat"; then
     hc::ok "passdb driver = passwd-file"
   else
     hc::fail "passdb: не найден driver=passwd-file"
   fi
 
-  if grep -qi 'userdb[^{]*\{[^}]*driver *= *static' <<<"$flat" && \
-     grep -qi 'home=/var/vmail/%d/%n' <<<"$flat"; then
+  # Ищем блок userdb { ... driver = static ... home=/var/vmail/%d/%n ... }
+  if grep -Eqi 'userdb[[:space:]]*\{[^}]*driver[[:space:]]*=[[:space:]]*static[^}]*home[[:space:]]*=[[:space:]]*/var/vmail/%d/%n' <<<"$flat"; then
     hc::ok "userdb static home=/var/vmail/%d/%n"
   else
     hc::fail "userdb: нет static/home=/var/vmail/%d/%n"
@@ -122,7 +122,6 @@ hc::check_maildirs() {
       fi
     done
 
-    # Проверим наличие INBOX (без создания)
     if doveadm mailbox status -u "$LOGIN" messages INBOX >/dev/null 2>&1; then
       log_info "INBOX OK для $LOGIN"
     else
