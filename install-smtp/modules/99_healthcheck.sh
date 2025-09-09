@@ -1,124 +1,167 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# 99_healthcheck.sh — проверки Dovecot/Maildir без изменений конфигурации
+set -Eeuo pipefail
+IFS=$'\n\t'
 
 MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 . "${MOD_DIR}/../lib/common.sh"
 : "${VARS_FILE:?}"
 
-#!/usr/bin/env bash
-# Module: Dovecot passwd-file + SMTP AUTH + Maildir и первичная инициализация
-set -euo pipefail
+hc::_yq() { yq -r "$1" "${VARS_FILE}"; }
 
-: "${VARS_FILE:?}"
+hc::first_user_login()   { hc::_yq '.users[0].login'; }
+hc::first_user_password(){ hc::_yq '.users[0].password'; }
 
-dovecot::_yq() { yq -r "$1" "${VARS_FILE}"; }
-
-dovecot::ensure_passdb_dir() {
-  run_cmd install -d -m 0750 -o root -g dovecot /etc/dovecot/passdb
+hc::user_dir_for() {
+  # login → /var/vmail/<domain>/<user>
+  local login="$1"
+  printf '/var/vmail/%s/%s' "${login#*@}" "${login%@*}"
 }
 
-dovecot::render_passdb_from_vars() {
-  local users_file=/etc/dovecot/passdb/users
-  : >"$users_file"
-  while IFS=$'\t' read -r LOGIN PASSWORD; do
-    [[ -n "${LOGIN:-}" && -n "${PASSWORD:-}" ]] || continue
-    local HASH; HASH="$(doveadm pw -s SHA512-CRYPT -p "$PASSWORD")"
-    printf '%s:%s\n' "$LOGIN" "$HASH" >>"$users_file"
-  done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
-  run_cmd chown root:dovecot "$users_file"
-  run_cmd chmod 0640 "$users_file"
-}
+hc::fail() { log_error "$*"; return 1; }
+hc::ok()   { log_info  "$*"; return 0;  }
 
-dovecot::enable_passwdfile_auth() {
-  run_cmd sed -i 's/^!include[[:space:]]\+auth-system\.conf\.ext/#!include auth-system.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
-  run_cmd sed -i 's/^#\s*!include[[:space:]]\+auth-passwdfile\.conf\.ext/!include auth-passwdfile.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
-
-  local cfg=/etc/dovecot/conf.d/auth-passwdfile.conf.ext
-  local desired; desired="$(cat <<'EOF'
-passdb {
-  driver = passwd-file
-  args = scheme=SHA512-CRYPT username_format=%u /etc/dovecot/passdb/users
-}
-userdb {
-  driver = static
-  args = uid=vmail gid=vmail home=/var/vmail/%d/%n
-}
-EOF
-)"
-  if ! cmp -s <(printf '%s' "$desired") "$cfg" 2>/dev/null; then
-    log_info "Dovecot: обновляю $cfg"
-    printf '%s' "$desired" | run_cmd install -D -m 0644 /dev/stdin "$cfg"
+hc::check_service_active() {
+  if systemctl is-active --quiet dovecot; then
+    hc::ok "dovecot: service active"
+  else
+    hc::fail "dovecot: service NOT active"
   fi
 }
 
-dovecot::postfix_auth_socket() {
-  local cfg=/etc/dovecot/conf.d/90-postfix-auth.conf
-  local desired; desired="$(cat <<'EOF'
-auth_mechanisms = plain login
-disable_plaintext_auth = yes
-service auth {
-  unix_listener /var/spool/postfix/private/auth {
-    user = postfix
-    group = postfix
-    mode = 0660
-  }
-}
-EOF
-)"
-  if ! cmp -s <(printf '%s' "$desired") "$cfg" 2>/dev/null; then
-    log_info "Dovecot: пишу $cfg"
-    printf '%s' "$desired" | run_cmd install -D -m 0644 /dev/stdin "$cfg"
+hc::check_mail_location() {
+  local out
+  if ! out="$(doveconf -n 2>/dev/null)"; then
+    hc::fail "doveconf -n: failed" || return $?
   fi
-  run_cmd install -d -m 0750 -o postfix -g postfix /var/spool/postfix/private
-}
 
-dovecot::ensure_mail_location() {
-  if ! dovecot -n 2>/dev/null | grep -q '^mail_location ='; then
-    log_info "Dovecot: задаю mail_location (Maildir)"
-    cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-maildir.conf
-mail_location = maildir:/var/vmail/%d/%n/Maildir
-protocols = imap lmtp sieve pop3
-EOF
+  if grep -qE '^mail_location = maildir:/var/vmail/%d/%n/Maildir$' <<<"$out"; then
+    hc::ok "mail_location OK (Maildir)"
+  else
+    hc::fail "mail_location mismatch (ожидаю: maildir:/var/vmail/%d/%n/Maildir)"
   fi
 }
 
-dovecot::init_maildirs_and_inbox() {
-  # создаём каталоги и INBOX для всех пользователей
+hc::check_auth_config() {
+  local out flat
+  out="$(doveconf -n 2>/dev/null || true)"
+  flat="$(tr -d '\n' <<<"$out")"
+
+  if grep -qiE '^auth_mechanisms = .*plain.*login' <<<"$out"; then
+    hc::ok "auth_mechanisms OK (plain, login)"
+  else
+    hc::fail "auth_mechanisms: нет plain/login"
+  fi
+
+  if grep -qi 'passdb[^{]*\{[^}]*driver *= *passwd-file' <<<"$flat"; then
+    hc::ok "passdb driver = passwd-file"
+  else
+    hc::fail "passdb: не найден driver=passwd-file"
+  fi
+
+  if grep -qi 'userdb[^{]*\{[^}]*driver *= *static' <<<"$flat" && \
+     grep -qi 'home=/var/vmail/%d/%n' <<<"$flat"; then
+    hc::ok "userdb static home=/var/vmail/%d/%n"
+  else
+    hc::fail "userdb: нет static/home=/var/vmail/%d/%n"
+  fi
+}
+
+hc::check_postfix_auth_socket() {
+  local s="/var/spool/postfix/private/auth"
+  if [[ -S "$s" ]]; then
+    local meta; meta="$(stat -Lc '%U:%G %a' "$s" 2>/dev/null || true)"
+    if grep -q '^postfix:postfix 660$' <<<"$meta"; then
+      hc::ok "auth socket OK ($meta)"
+    else
+      hc::fail "auth socket perms/owner: ожидаю postfix:postfix 660, имею: $meta"
+    fi
+  else
+    hc::fail "auth socket отсутствует: $s"
+  fi
+}
+
+hc::check_passdb_file() {
+  local f="/etc/dovecot/passdb/users"
+  if [[ -f "$f" ]]; then
+    local meta; meta="$(stat -Lc '%U:%G %a' "$f" 2>/dev/null || true)"
+    if grep -q '^root:dovecot 640$' <<<"$meta"; then
+      hc::ok "passdb users OK ($meta)"
+    else
+      hc::fail "passdb users perms/owner: ожидаю root:dovecot 640, имею: $meta"
+    fi
+  else
+    hc::fail "passdb users отсутствует: $f"
+  fi
+}
+
+hc::check_maildirs() {
+  local rc=0
   while IFS=$'\t' read -r LOGIN _; do
     [[ -n "${LOGIN:-}" ]] || continue
-    local d="/var/vmail/${LOGIN#*@}/${LOGIN%@*}"
-    run_cmd install -d -m 0750 -o vmail -g vmail "$d/Maildir"/{cur,new,tmp}
-    # создаём INBOX через doveadm (не падаем, если уже есть)
-    if ! doveadm mailbox list -u "$LOGIN" >/dev/null 2>&1; then
-      :
+    local d; d="$(hc::user_dir_for "$LOGIN")"
+
+    if [[ -d "$d" ]]; then
+      local meta; meta="$(stat -Lc '%U:%G %a' "$d" 2>/dev/null || true)"
+      if ! grep -q '^vmail:vmail 750$' <<<"$meta"; then
+        log_error "Maildir root perms/owner: ожидаю vmail:vmail 750 для $d, имею: $meta"; rc=1
+      fi
+    else
+      log_error "Maildir root отсутствует: $d"; rc=1
     fi
-    doveadm mailbox create -u "$LOGIN" INBOX >/dev/null 2>&1 || true
-    log_info "Dovecot: подготовлен Maildir для ${LOGIN}"
+
+    for sub in cur new tmp; do
+      local sd="$d/Maildir/$sub"
+      if [[ -d "$sd" ]]; then
+        local sm; sm="$(stat -Lc '%U:%G %a' "$sd" 2>/dev/null || true)"
+        if ! grep -q '^vmail:vmail 750$' <<<"$sm"; then
+          log_error "Maildir/$sub perms/owner: ожидаю vmail:vmail 750 для $sd, имею: $sm"; rc=1
+        fi
+      else
+        log_error "Подкаталог отсутствует: $sd"; rc=1
+      fi
+    done
+
+    # Проверим наличие INBOX (без создания)
+    if doveadm mailbox status -u "$LOGIN" messages INBOX >/dev/null 2>&1; then
+      log_info "INBOX OK для $LOGIN"
+    else
+      log_warn "INBOX не доступен/не создан для $LOGIN"
+    fi
   done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
+
+  [[ $rc -eq 0 ]] && hc::ok "Maildir: структура и права выглядят корректно" || return 1
 }
 
-dovecot::restart_and_selftest() {
-  run_cmd systemctl enable --now dovecot
-  run_cmd systemctl restart dovecot
-
+hc::selftest_auth() {
   local u p
-  u="$(dovecot::_yq '.users[0].login')"
-  p="$(dovecot::_yq '.users[0].password')"
+  u="$(hc::first_user_login || true)"
+  p="$(hc::first_user_password || true)"
+  [[ -n "$u" && -n "$p" ]] || { hc::fail "users[0] не задан в vars"; return 1; }
+
   if doveadm auth test -x service=smtp "$u" "$p" >/dev/null 2>&1; then
-    log_info "Dovecot: SMTP AUTH OK (${u})"
+    hc::ok "SMTP AUTH OK (${u})"
   else
-    log_warn "Dovecot: SMTP AUTH FAIL (${u}) — см. /var/log/mail.log"
+    hc::fail "SMTP AUTH FAIL (${u}) — см. /var/log/mail.log"
   fi
 }
 
 module::main() {
-  dovecot::ensure_passdb_dir
-  dovecot::render_passdb_from_vars
-  dovecot::enable_passwdfile_auth
-  dovecot::postfix_auth_socket
-  dovecot::ensure_mail_location
-  dovecot::init_maildirs_and_inbox
-  dovecot::restart_and_selftest
+  local rc=0
+  hc::check_service_active      || rc=1
+  hc::check_mail_location       || rc=1
+  hc::check_auth_config         || rc=1
+  hc::check_postfix_auth_socket || rc=1
+  hc::check_passdb_file         || rc=1
+  hc::check_maildirs            || rc=1
+  hc::selftest_auth             || rc=1
+
+  if [[ $rc -eq 0 ]]; then
+    log_info "HEALTHCHECK: OK"
+  else
+    log_warn "HEALTHCHECK: есть проблемы (rc=$rc)"
+  fi
+  exit "$rc"
 }
 
 module::main "$@"

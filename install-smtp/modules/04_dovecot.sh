@@ -1,21 +1,10 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# 04_dovecot.sh — Dovecot: passwd-file, SMTP AUTH, Maildir и первичная инициализация
+set -Eeuo pipefail
+IFS=$'\n\t'
 
 MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 . "${MOD_DIR}/../lib/common.sh"
-: "${VARS_FILE:?}"
-
-#!/usr/bin/env bash
-set -euo pipefail
-
-MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-
-: "${VARS_FILE:?}"
-
-#!/usr/bin/env bash
-# Module: Dovecot passwd-file + SMTP AUTH + Maildir и первичная инициализация
-set -euo pipefail
-
 : "${VARS_FILE:?}"
 
 dovecot::_yq() { yq -r "$1" "${VARS_FILE}"; }
@@ -80,7 +69,7 @@ EOF
 }
 
 dovecot::ensure_mail_location() {
-  if ! dovecot -n 2>/dev/null | grep -q '^mail_location ='; then
+  if ! doveconf -n 2>/dev/null | grep -q '^mail_location ='; then
     log_info "Dovecot: задаю mail_location (Maildir)"
     cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-maildir.conf
 mail_location = maildir:/var/vmail/%d/%n/Maildir
@@ -90,15 +79,14 @@ EOF
 }
 
 dovecot::init_maildirs_and_inbox() {
-  # создаём каталоги и INBOX для всех пользователей
+  # создаём корень ящика и Maildir для всех пользователей (до первого логина)
   while IFS=$'\t' read -r LOGIN _; do
     [[ -n "${LOGIN:-}" ]] || continue
     local d="/var/vmail/${LOGIN#*@}/${LOGIN%@*}"
+
+    run_cmd install -d -m 0750 -o vmail -g vmail "$d"
     run_cmd install -d -m 0750 -o vmail -g vmail "$d/Maildir"/{cur,new,tmp}
-    # создаём INBOX через doveadm (не падаем, если уже есть)
-    if ! doveadm mailbox list -u "$LOGIN" >/dev/null 2>&1; then
-      :
-    fi
+
     doveadm mailbox create -u "$LOGIN" INBOX >/dev/null 2>&1 || true
     log_info "Dovecot: подготовлен Maildir для ${LOGIN}"
   done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
