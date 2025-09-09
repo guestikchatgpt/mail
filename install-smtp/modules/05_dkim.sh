@@ -74,7 +74,7 @@ SigningTable            file:/etc/opendkim/SigningTable
 InternalHosts           /etc/opendkim/TrustedHosts
 ExternalIgnoreList      /etc/opendkim/TrustedHosts
 
-Canonicalization        relaxed/simple
+Canonicalization        relaxed/relaxed
 MinimumKeyBits          1024
 OversignHeaders         From
 TrustAnchorFile         /usr/share/dns/root.key
@@ -99,31 +99,31 @@ dkim::wire_postfix() {
   run_cmd postconf -e "milter_protocol=6"
   run_cmd postconf -e "milter_default_action=accept"
 
-  local sockets_inbound="${DKIM_SOCK}"
-  [[ -S /var/spool/postfix/opendmarc/opendmarc.sock ]] && sockets_inbound="${sockets_inbound},${DMARC_SOCK}"
+  # гарантируем, что сокеты заданы даже если dkim::vars не вызывали
+  : "${DKIM_SOCK:=unix:/var/spool/postfix/opendkim/opendkim.sock}"
+  : "${DMARC_SOCK:=unix:/var/spool/postfix/opendmarc/opendmarc.sock}"
 
-  # впишем DKIM (и DMARC, если есть) в начало списка milters
-  local have; have="$(postconf -h smtpd_milters || true)"
-  if [[ -z "${have// }" ]]; then
-    have="${sockets}"
-  else
-    if ! grep -q 'opendkim/opendkim\.sock' <<<"${have}"; then
-      have="${DKIM_SOCK}${have:+,${have}}"
-    fi
-    if [[ "${sockets}" == *opendmarc* ]] && ! grep -q 'opendmarc/opendmarc\.sock' <<<"${have}"; then
-      have="${have},${DMARC_SOCK}"
-    fi
+  # inbound (25): DKIM + DMARC (если сокет DMARC реально существует)
+  local sockets_inbound
+  sockets_inbound="${DKIM_SOCK}"
+  if [[ -S /var/spool/postfix/opendmarc/opendmarc.sock ]]; then
+    sockets_inbound="${sockets_inbound},${DMARC_SOCK}"
   fi
 
+  # порт 25 (вход): DKIM(+DMARC)
   run_cmd postconf -e "smtpd_milters=${sockets_inbound}"
+  # локальная отправка через pickup/cleanup — только DKIM
   run_cmd postconf -e "non_smtpd_milters=${DKIM_SOCK}"
 
+  # MSA (587/465): только DKIM (DMARC на исходящих не нужен)
   run_cmd postconf -P "submission/inet/milter_macro_daemon_name=ORIGINATING"
   run_cmd postconf -P "smtps/inet/milter_macro_daemon_name=ORIGINATING"
   run_cmd postconf -P "submission/inet/smtpd_milters=${DKIM_SOCK}"
   run_cmd postconf -P "smtps/inet/smtpd_milters=${DKIM_SOCK}"
+
   run_cmd systemctl reload postfix || run_cmd systemctl restart postfix
 }
+
 
 dkim::restart_and_export_txt() {
   run_cmd systemctl enable --now opendkim
