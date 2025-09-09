@@ -1,0 +1,2183 @@
+==================== НАЧАЛО: ./README.md ====================
+
+# install-smtp
+
+Автодеплой **Postfix + Dovecot + OpenDKIM + OpenDMARC + Fail2ban** на чистый VPS.
+Один `vars.yaml` на входе → рабочий инстанс с TLS 1.2/1.3, DKIM/SPF/DMARC, healthcheck и отчётом.
+
+---
+
+## Требования
+
+- Debian 12 / Ubuntu 24.04 (root/sudo)
+- `yq` v4, `curl`, `openssl`
+- Публичный **A-запись** на `hostname` (нужна для LE HTTP-challenge на :80)
+
+## Что ставится
+
+- **Postfix** (SMTP: 587/STARTTLS, 465/SMTPS; опционально 25/tcp для входящей)
+- **Dovecot** (IMAPS 993, POP3S 995, LMTP, SASL proxy для Postfix)
+- **OpenDKIM** (подпись исходящих, 2048-bit)
+- **OpenDMARC** (проверка входящих)
+- **Fail2ban** (jails: postfix, postfix-sasl, dovecot)
+- **Certbot** c deploy-hook (reload Postfix/Dovecot на реню)
+- Базовый firewall-модуль для UFW/firewalld
+
+Пути:
+- LE: `/etc/letsencrypt/live/<hostname>/{fullchain.pem,privkey.pem}`
+- DKIM: `/etc/opendkim/keys/<domain>/<selector>.{private,txt}`
+- Манифест: `/var/local/msa/manifest.json`
+- Отчёт (Markdown): `/var/local/msa/report.md`
+
+---
+
+## Быстрый старт
+
+```bash
+cd install-smtp
+cp vars.yaml.example vars.yaml
+# отредактируй domain/hostname/ipv4, users, (необязательно) acme_email/dkim_selector
+
+# предварительно укажи A-запись на hostname -> ipv4, чтобы LE выдал сертификат
+./install.sh --vars vars.yaml
+
+==================== КОНЕЦ: ./README.md ======================
+
+
+==================== НАЧАЛО: ./install-smtp/vars.yaml.example ====================
+
+# единственный источник правды для инсталлятора
+
+# Базовое
+domain: example.com
+hostname: mail.example.com      # если не указать — инсталлятор подставит mail.<domain>
+ipv4: 1.2.3.4
+
+# Приём входящей почты на 25/tcp
+accept_inbound: true            # true — слушаем 25 и открываем fw; false — только 465/587
+
+# Пользователи (виртуальные ящики Dovecot) — ЛОГИНЫ И ПАРОЛИ НА МЕСТЕ
+users:
+  - login: info@example.com
+    password: "S3cret!"
+  # - login: sales@example.com
+  #   password: "AnotherS3cret!"
+
+# Let's Encrypt
+acme_email: noc@example.com
+
+# DKIM
+dkim_selector: s1               # селектор для 05_dkim.sh
+
+# Beget API для 09_beget_dns.sh
+beget:
+  login: "mybegetlogin"         # не e-mail, именно логин аккаунта Beget
+  password: "xxxxxxxxxxxxxxxx"     # API-токен из панели Beget
+
+# Тонкая настройка 09_beget_dns.sh (всё опционально)
+dns_update:
+  dry_run: false                # true = только показать diff (или добавь флаг --dry-run в CLI)
+  ttl_default: 3600
+  spf_policy: warn              # warn|append — warn: не трогаем существующий SPF; append: аккуратно добавим a:<hostname>
+  msa_state_dir: /var/local/msa
+  msa_manifest: /var/local/msa/manifest.json
+  msa_dkim_txt: /var/local/msa/dkim.txt
+
+==================== КОНЕЦ: ./install-smtp/vars.yaml.example ======================
+
+
+==================== НАЧАЛО: ./install-smtp/lib/json_builder.sh ====================
+
+# lib/json_builder.sh — минимальный билдер JSON без внешних зависимостей.
+# Глобальные переменные: __JSON, __FIRST
+
+# Экранирование для строк JSON (достаточно для наших данных)
+json_escape() {
+  # заменяем \, ", и управляющие \n \r \t
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+json_begin() { __JSON="{"; __FIRST=1; }
+
+# низкоуровневый: добавить пару "key":<raw>
+json_add_kv_raw() {
+  local key="$1" raw="$2"
+  if [[ "${__FIRST}" -eq 0 ]]; then __JSON+=","
+  else __FIRST=0; fi
+  __JSON+="\"$(json_escape "$key")\":${raw}"
+}
+
+json_add_string() {
+  local key="$1" val="$2"
+  json_add_kv_raw "$key" "\"$(json_escape "$val")\""
+}
+
+json_add_object() {
+  local key="$1" obj="$2"
+  json_add_kv_raw "$key" "${obj}"
+}
+
+json_add_array_strings() {
+  local key="$1"; shift
+  local out="[" first=1 x
+  for x in "$@"; do
+    if [[ $first -eq 0 ]]; then out+=","
+    else first=0; fi
+    out+="\"$(json_escape "$x")\""
+  done
+  out+="]"
+  json_add_kv_raw "$key" "$out"
+}
+
+json_end() { __JSON+="}"; printf '%s' "$__JSON"; }
+
+==================== КОНЕЦ: ./install-smtp/lib/json_builder.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/lib/log.sh ====================
+
+# lib/log.sh — совместимость для старых модулей
+# Использует log_* из common.sh
+. "$(dirname "$0")/common.sh"
+
+==================== КОНЕЦ: ./install-smtp/lib/log.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/lib/common.sh ====================
+
+# lib/common.sh — общие хелперы
+# shellcheck shell=bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+shopt -s expand_aliases
+alias log::info='log_info'
+alias log::warn='log_warn'
+alias log::error='log_error'
+alias log::err='log_error'
+_ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+log_info()  { printf '[%s] [INFO]  %s\n'  "$(_ts)" "$*" >&2; }
+log_warn()  { printf '[%s] [WARN]  %s\n'  "$(_ts)" "$*" >&2; }
+log_error() { printf '[%s] [ERROR] %s\n'  "$(_ts)" "$*" >&2; }
+
+die() {
+  local code=1
+  if [[ $# -ge 1 && "$1" =~ ^[0-9]+$ ]]; then code="$1"; shift; fi
+  log_error "$*"
+  exit "${code}"
+}
+
+# Безопасное выполнение команд с уважением к DRY_RUN.
+# Поведение:
+# - Если передана одна строка — исполняем через bash -c (для пайпов и т.п.).
+# - Если передано несколько аргументов:
+#     * Если в начале идут присваивания вида KEY=VALUE — исполняем через /usr/bin/env KEY=VALUE cmd args...
+#     * Иначе — исполняем напрямую без шелла.
+run_cmd() {
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    log_info "DRY-RUN: $*"
+    return 0
+  fi
+
+  # Несколько аргументов → прямая exec с поддержкой префиксных VAR=VAL
+  if [[ $# -gt 1 ]]; then
+    local -a argv=( "$@" )
+    local i=0
+    # Ищем ведущие присваивания окружения KEY=VALUE
+    while (( i < ${#argv[@]} )); do
+      # Разрешаем только корректные имена переменных окружения
+      if [[ "${argv[$i]}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        ((i++))
+        continue
+      fi
+      break
+    done
+
+    if (( i > 0 )); then
+      # Есть хотя бы одно присваивание окружения → запускаем через env
+      log_info "RUN: env ${argv[*]}"
+      /usr/bin/env "${argv[@]}"
+    else
+      log_info "RUN: ${argv[*]}"
+      "${argv[@]}"
+    fi
+    return
+  fi
+
+  # Один аргумент — строка (нужен шелл для пайпов/редиректов)
+  local cmd="$*"
+  log_info "RUN: $cmd"
+  /bin/bash -o pipefail -c "$cmd"
+}
+
+ensure_root_or_die() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    die 1 "Нужны root-привилегии (sudo) для режима установки"
+  fi
+}
+
+require_cmd() {
+  local c="$1"
+  command -v "$c" >/dev/null 2>&1 || die 1 "Не найден бинарь: $c"
+}
+
+==================== КОНЕЦ: ./install-smtp/lib/common.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/install.sh ====================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- раннее логирование во встроенный файл + на экран ---
+LOG_DIR="/var/log/msa"
+mkdir -p "${LOG_DIR}"
+export LOG_FILE="${LOG_DIR}/install-$(date -u +%Y%m%d-%H%M%S).log"
+# Дублируем stdout/stderr и в файл, и на экран
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+# --- bootstrap logger used до загрузки общих хелперов ---
+if [[ "$(type -t log 2>/dev/null)" != "function" ]]; then
+  log(){ printf '[%(%FT%TZ)T] [%s] %s\n' -1 "${1:-INFO}" "${*:2}"; }
+fi
+if [[ "$(type -t run 2>/dev/null)" != "function" ]]; then
+  run(){ log INFO "RUN: $*"; "$@"; }
+fi
+# --- конец бутстрапа ---
+
+# --- paths --------------------------------------------------------------------
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+MODULES_DIR="${SCRIPT_DIR}/modules"
+LIB_DIR="${SCRIPT_DIR}/lib"
+
+# --- libs ---------------------------------------------------------------------
+# shellcheck disable=SC1090
+source "${LIB_DIR}/common.sh"   # die, run_cmd, require_cmd, log_*
+
+# --- globals ------------------------------------------------------------------
+VARS_FILE=""
+MODE="install"        # install | healthcheck | print-dns
+DRY_RUN=false
+
+# --- utils --------------------------------------------------------------------
+require_yq_v4() {
+  require_cmd yq
+  local out major
+  out="$(yq -V 2>&1 || true)"
+  major="$(grep -oE '[0-9]+' <<<"$out" | head -n1 || true)"
+  if [[ -z "${major:-}" || "${major}" -lt 4 ]]; then
+    die "Нужен yq v4+, найдено: ${out:-unknown}"
+  fi
+}
+
+ensure_root_if_needed() {
+  if [[ "${DRY_RUN}" == "false" && "${EUID}" -ne 0 ]]; then
+    die "Нужны root-привилегии (sudo) для режима установки"
+  fi
+}
+
+# ===== ensure yq v4+ (автоустановка при необходимости) =====
+ensure_yq_v4() {
+  _log(){ printf '[%(%FT%TZ)T] [%s] %s\n' -1 "${1:-INFO}" "${*:2}"; }
+
+  local need_major=4 cur="" major=""
+  if command -v yq >/dev/null 2>&1; then
+    cur="$(yq --version 2>/dev/null || true)"   # e.g. "yq (...) version v4.47.1"
+    major="$(printf '%s\n' "$cur" | sed -n 's/.*version v\{0,1\}\([0-9]\+\).*/\1/p')"
+    if [[ -n "$major" && "$major" -ge "$need_major" ]]; then
+      _log INFO "yq найден: ${cur}"
+      return 0
+    fi
+    _log WARN "нужен yq v4+, найдено: ${cur:-unknown} — обновляю бинарник"
+  else
+    _log INFO "yq не найден — ставлю свежий v4"
+  fi
+
+  if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+    _log INFO "ставлю wget для загрузки yq…"
+    apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get -y install wget ca-certificates >/dev/null 2>&1 || true
+  fi
+
+  local url="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+  if command -v wget >/dev/null 2>&1; then
+    wget -q "$url" -O /usr/local/bin/yq
+  else
+    curl -fsSL "$url" -o /usr/local/bin/yq
+  fi
+  chmod +x /usr/local/bin/yq || true
+
+  local newver; newver="$(yq --version 2>/dev/null || true)"
+  if ! grep -q 'version v4' <<<"$newver"; then
+    _log ERROR "не удалось установить yq v4 (текущее: ${newver})"
+    exit 1
+  fi
+  _log INFO "yq установлен: ${newver}"
+}
+
+ensure_yq_v4
+
+usage() {
+  printf '%s\n' \
+"usage: $0 --vars vars.yaml [--dry-run] [--healthcheck] [--print-dns]
+  --vars FILE      путь к vars.yaml (обязателен для install/print-dns)
+  --dry-run        не выполнять изменяющие команды
+  --healthcheck    запустить только 99_healthcheck.sh
+  --print-dns      вывести DNS-записи (A/MX/SPF/DKIM/DMARC)
+  -h, --help       показать эту справку"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vars|-f)
+        [[ $# -ge 2 ]] || die "--vars требует путь к файлу"
+        VARS_FILE="$2"; shift 2;;
+      --dry-run)
+        DRY_RUN=true; shift;;
+      --healthcheck|-m)
+        # Совместимость: -m healthcheck
+        if [[ "$1" == "-m" ]]; then
+          [[ $# -ge 2 ]] || die "-m требует значение (install|healthcheck|print-dns)"
+          MODE="$2"; shift 2
+        else
+          MODE="healthcheck"; shift
+        fi
+        ;;
+      --print-dns)
+        MODE="print-dns"; shift;;
+      -h|--help)
+        usage; exit 0;;
+      *)
+        die "Неизвестный аргумент: $1";;
+    esac
+  done
+  if [[ -z "${VARS_FILE}" && "${MODE}" != "healthcheck" ]]; then
+    die "Укажите --vars <file>"
+  fi
+}
+
+load_and_validate_vars() {
+  require_yq_v4
+  [[ -r "${VARS_FILE}" ]] || die "vars.yaml не найден: ${VARS_FILE}"
+
+  export DOMAIN HOSTNAME IPV4 ACCEPT_INBOUND ACME_EMAIL DKIM_SELECTOR
+
+  DOMAIN="$(yq -r '.domain // ""' "${VARS_FILE}")"
+  HOSTNAME="$(yq -r ".hostname // (\"mail.\" + .domain)" "${VARS_FILE}")"
+  IPV4="$(yq -r '.ipv4 // ""' "${VARS_FILE}")"
+  ACME_EMAIL="$(yq -r ".acme_email // (\"postmaster@\" + .domain)" "${VARS_FILE}")"
+  DKIM_SELECTOR="$(yq -r ".dkim_selector // \"s1\"" "${VARS_FILE}")"
+
+  # accept_inbound: явный флаг имеет приоритет; иначе — по mode (default full_mail)
+  if yq -e '.accept_inbound' "${VARS_FILE}" >/dev/null 2>&1; then
+    ACCEPT_INBOUND="$(yq -r '.accept_inbound' "${VARS_FILE}")"
+  else
+    MODE_MAIL="$(yq -r '.mode // "full_mail"' "${VARS_FILE}")"
+    if [[ "${MODE_MAIL}" == "outbound_only" ]]; then
+      ACCEPT_INBOUND="false"
+    else
+      ACCEPT_INBOUND="true"
+    fi
+  fi
+
+  local users_count
+  users_count="$(yq -r '.users // [] | length' "${VARS_FILE}")"
+
+  [[ -n "${DOMAIN}"   ]] || die "В vars.yaml отсутствует domain"
+  [[ -n "${HOSTNAME}" ]] || die "В vars.yaml отсутствует hostname/логика подстановки"
+  [[ -n "${IPV4}"    ]] || die "В vars.yaml отсутствует ipv4"
+  [[ "${users_count}" -ge 1 ]] || die "В vars.yaml нет пользователей (.users)"
+
+  if ! grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' <<<"${IPV4}"; then
+    die "Неверный формат IPv4: ${IPV4}"
+  fi
+
+  log_info "vars.yaml ок: domain=${DOMAIN}, hostname=${HOSTNAME}, ipv4=${IPV4}, users=${users_count}, mode=${MODE}, accept_inbound=${ACCEPT_INBOUND}, dry_run=${DRY_RUN}"
+}
+
+# --- module loader ------------------------------------------------------------
+source_modules_install() {
+  # Загрузим ВСЕ модули вида NN_name.sh (включая 100_report.sh и т.д.) по возрастанию
+  while IFS= read -r -d '' mod; do
+    log_info "Загружаю модуль: $(basename "$mod")"
+    # shellcheck disable=SC1090
+    source "$mod"
+  done < <(find "${MODULES_DIR}" -maxdepth 1 -type f -name '[0-9]*_*.sh' -print0 | sort -z -V)
+}
+
+source_module_healthcheck_only() {
+  local hc="${MODULES_DIR}/99_healthcheck.sh"
+  [[ -f "${hc}" ]] || die "Не найден modules/99_healthcheck.sh"
+  log_info "Загружаю модуль: 99_healthcheck.sh"
+  # shellcheck disable=SC1090
+  source "${hc}"
+}
+
+# --- manifest builder (встроенный) --------------------------------------------
+json_escape() {
+  local s="${1:-}"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"
+  printf '%s' "$s"
+}
+
+emit_manifest() {
+  local ports_json le_json dns_json auth_json hc_json
+
+  # ports (собираем PORT_*)
+  ports_json="{"
+  local first=true
+  while IFS='=' read -r k v; do
+    local port="${k#PORT_}"
+    $first || ports_json+=","
+    first=false
+    ports_json+="\"${port}\":\"$(json_escape "${v}")\""
+  done < <(env | grep -E '^PORT_[0-9]+=' || true)
+  ports_json+="}"
+
+  # le
+  le_json="{\"domain\":\"$(json_escape "${HOSTNAME}")\""
+  if [[ -n "${LE_VALID_UNTIL:-}" ]]; then
+    le_json+=",\"valid_until\":\"$(json_escape "${LE_VALID_UNTIL}")\""
+  fi
+  le_json+="}"
+
+  # dns
+  local dkim_selector="${DKIM_SELECTOR:-s1}"
+  local dkim_txt="${DKIM_DNS_TXT:-}"
+  local dmarc_txt="${DMARC_TXT:-v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}}"
+
+  dns_json="{"
+  dns_json+="\"selector\":\"$(json_escape "${dkim_selector}")\""
+  if [[ -n "${dkim_txt}" ]]; then
+    dns_json+=",\"txt\":\"$(json_escape "${dkim_txt}")\""
+    dns_json+=",\"DKIM\":{\"selector\":\"$(json_escape "${dkim_selector}")\",\"txt\":\"$(json_escape "${dkim_txt}")\"}"
+  fi
+  dns_json+=",\"DMARC\":\"$(json_escape "${dmarc_txt}")\""
+  dns_json+="}"
+
+  # auth (логины из vars.yaml) — ИСПРАВЛЕНО: без 'empty' для yq v4
+  local logins
+  mapfile -t logins < <(yq -r '.users[]?.login // ""' "${VARS_FILE}" | sed '/^$/d')
+  auth_json="["
+  for i in "${!logins[@]}"; do
+    [[ $i -gt 0 ]] && auth_json+=","
+    if [[ "${logins[$i]}" == *"@"* ]]; then
+      auth_json+="\"$(json_escape "${logins[$i]}")\""
+    else
+      auth_json+="\"$(json_escape "${logins[$i]}@${DOMAIN}")\""
+    fi
+  done
+  auth_json+="]"
+
+  # healthcheck (HC_* из env)
+  hc_json="{"
+  first=true
+  while IFS='=' read -r k v; do
+    $first || hc_json+=","
+    first=false
+    hc_json+="\"$(json_escape "${k#HC_}")\":\"$(json_escape "${v}")\""
+  done < <(env | grep -E '^HC_' || true)
+  hc_json+="}"
+
+  # итоговый объект
+  local manifest
+  manifest="{"
+  manifest+="\"hostname\":\"$(json_escape "${HOSTNAME}")\","
+  manifest+="\"ipv4\":\"$(json_escape "${IPV4}")\","
+  manifest+="\"ports\":${ports_json},"
+  manifest+="\"le\":${le_json},"
+  manifest+="\"dns\":${dns_json},"
+  manifest+="\"auth\":{\"users_created\":${auth_json}},"
+  manifest+="\"healthcheck\":${hc_json}"
+  manifest+="}"
+
+  run_cmd "install -d -m 0755 /var/local/msa"
+  local tmp; tmp="$(mktemp)"
+  printf '%s\n' "${manifest}" > "${tmp}"
+  run_cmd "install -m 0644 '${tmp}' /var/local/msa/manifest.json"
+  rm -f "${tmp}"
+  log_info "manifest.json записан в /var/local/msa/manifest.json"
+  printf '%s\n' "${manifest}"
+}
+
+# --- extra modes --------------------------------------------------------------
+run_print_dns() {
+  echo "=== DNS records to add for ${DOMAIN} / ${HOSTNAME} ==="
+  echo
+  echo "A     ${HOSTNAME}.      ${IPV4}"
+  echo "MX    ${DOMAIN}.        10 ${HOSTNAME}."
+  echo "TXT   ${DOMAIN}.        v=spf1 mx -all"
+  local dkim_selector="${DKIM_SELECTOR:-s1}"
+  if [[ -n "${DKIM_DNS_TXT:-}" ]]; then
+    echo "TXT   ${dkim_selector}._domainkey.${DOMAIN}.  ${DKIM_DNS_TXT}"
+  else
+    echo "TXT   ${dkim_selector}._domainkey.${DOMAIN}.  (после генерации ключа)"
+  fi
+  echo "TXT   _dmarc.${DOMAIN}.  ${DMARC_TXT:-v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}}"
+  echo
+}
+
+# --- modes --------------------------------------------------------------------
+run_install() {
+  ensure_root_if_needed
+  echo "Starting installation for domain ${DOMAIN} (hostname ${HOSTNAME}, ipv4 ${IPV4})..."
+  source_modules_install
+  emit_manifest
+}
+
+run_healthcheck() {
+  source_module_healthcheck_only
+  if declare -F healthcheck::run_all >/dev/null 2>&1; then
+    healthcheck::run_all || true
+  else
+    die "В 99_healthcheck.sh нет функции healthcheck::run_all"
+  fi
+}
+
+# --- main ---------------------------------------------------------------------
+main() {
+  parse_args "$@"
+
+  if [[ "${MODE}" != "healthcheck" ]]; then
+    load_and_validate_vars
+  else
+    log_info "mode=healthcheck"
+  fi
+
+  case "${MODE}" in
+    install)      run_install ;;
+    healthcheck)  run_healthcheck ;;
+    print-dns)    run_print_dns ;;
+    *)            die "Неизвестный режим: ${MODE}" ;;
+  esac
+}
+
+main "$@"
+
+==================== КОНЕЦ: ./install-smtp/install.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/06_ssl.sh ====================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
+# Module: SSL/Certbot + TLS для Postfix/Dovecot (функции + entrypoint)
+set -euo pipefail
+
+# используем общий логгер/раннер
+
+: "${VARS_FILE:?}"
+
+ssl::_yq() { yq -r "$1" "${VARS_FILE}"; }
+
+ssl::vars() {
+  DOMAIN="$(ssl::_yq '.domain')"
+  HOSTNAME="$(ssl::_yq '.hostname // ("mail." + .domain)')"
+  IPV4="$(ssl::_yq '.ipv4')"
+  ACME_EMAIL="$(ssl::_yq '.acme_email // ("postmaster@" + .domain)')"
+  : "${DOMAIN:?}"; : "${HOSTNAME:?}"; : "${IPV4:?}"; : "${ACME_EMAIL:?}"
+}
+
+ssl::wait_a() {
+  local fqdn="$1" want="$2" timeout="${3:-300}"
+  log_info "LE: жду A(${fqdn})=${want} (до ${timeout}s)"
+  local t=0
+  while (( t < timeout )); do
+    if dig +short A "${fqdn}" @8.8.8.8 | grep -qx "${want}"; then
+      log_info "A(${fqdn})=${want} — ок"
+      return 0
+    fi
+    sleep 3; t=$((t+3))
+  done
+  log_warn "LE: таймаут ожидания A(${fqdn})=${want}"
+  return 1
+}
+
+ssl::port80_busy() {
+  ss -ltn 2>/dev/null | awk '{print $4}' | grep -q '[:.]80$'
+}
+
+ssl::obtain_cert() {
+  log_info "LE: запрашиваю сертификат для ${HOSTNAME}"
+  if ssl::port80_busy; then
+    if command -v nginx >/dev/null 2>&1; then
+      run_cmd certbot --nginx --non-interactive --agree-tos --no-eff-email \
+        -m "${ACME_EMAIL}" -d "${HOSTNAME}"
+    elif command -v apache2 >/dev/null 2>&1 || command -v httpd >/dev/null 2>&1; then
+      run_cmd certbot --apache --non-interactive --agree-tos --no-eff-email \
+        -m "${ACME_EMAIL}" -d "${HOSTNAME}"
+    else
+      die 1 "Порт 80 занят неизвестным сервисом. Нужен nginx/apache для плагина certbot, либо освободить :80."
+    fi
+  else
+    run_cmd certbot certonly --standalone --preferred-challenges http \
+      --non-interactive --agree-tos --no-eff-email -m "${ACME_EMAIL}" -d "${HOSTNAME}"
+  fi
+
+  CRT="/etc/letsencrypt/live/${HOSTNAME}/fullchain.pem"
+  KEY="/etc/letsencrypt/live/${HOSTNAME}/privkey.pem"
+  [[ -s "$CRT" && -s "$KEY" ]] || die 1 "Сертификат не получен: ${CRT}/${KEY} отсутствуют"
+}
+
+ssl::install_deploy_hook() {
+  run_cmd install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+  run_cmd install -m 0755 /dev/stdin /etc/letsencrypt/renewal-hooks/deploy/99-reload-mail-services.sh <<'EOF'
+#!/usr/bin/env bash
+systemctl reload postfix || systemctl restart postfix
+systemctl reload dovecot || systemctl restart dovecot
+EOF
+}
+
+ssl::configure_dovecot() {
+  run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-tls.conf <<EOF
+ssl = required
+ssl_cert = </etc/letsencrypt/live/${HOSTNAME}/fullchain.pem
+ssl_key  = </etc/letsencrypt/live/${HOSTNAME}/privkey.pem
+EOF
+  run_cmd systemctl enable --now dovecot
+  run_cmd dovecot -n >/dev/null
+  run_cmd systemctl reload dovecot || systemctl restart dovecot
+}
+
+ssl::configure_postfix() {
+  # глобальные файлы
+  run_cmd postconf -e "smtpd_tls_cert_file=/etc/letsencrypt/live/${HOSTNAME}/fullchain.pem"
+  run_cmd postconf -e "smtpd_tls_key_file=/etc/letsencrypt/live/${HOSTNAME}/privkey.pem"
+  # per-service policy
+  run_cmd postconf -P submission/inet/smtpd_tls_security_level=encrypt
+  run_cmd postconf -P submission/inet/smtpd_sasl_auth_enable=yes
+  run_cmd postconf -P submission/inet/smtpd_tls_cert_file="/etc/letsencrypt/live/${HOSTNAME}/fullchain.pem"
+  run_cmd postconf -P submission/inet/smtpd_tls_key_file="/etc/letsencrypt/live/${HOSTNAME}/privkey.pem"
+
+  run_cmd postconf -P smtps/inet/smtpd_tls_wrappermode=yes
+  run_cmd postconf -P smtps/inet/smtpd_sasl_auth_enable=yes
+  run_cmd postconf -P smtps/inet/smtpd_tls_cert_file="/etc/letsencrypt/live/${HOSTNAME}/fullchain.pem"
+  run_cmd postconf -P smtps/inet/smtpd_tls_key_file="/etc/letsencrypt/live/${HOSTNAME}/privkey.pem"
+
+  run_cmd postfix check
+  run_cmd systemctl reload postfix || systemctl restart postfix
+}
+
+module::main() {
+  ssl::vars
+  # 02_pre_dns.sh уже должен был проставить A-записи
+  ssl::wait_a "${DOMAIN}"  "${IPV4}" || true
+  ssl::wait_a "${HOSTNAME}" "${IPV4}" || true
+  ssl::obtain_cert
+  ssl::install_deploy_hook
+  ssl::configure_dovecot
+  ssl::configure_postfix
+  log_info "LE/TLS: завершено"
+}
+
+module::main "$@"
+
+==================== КОНЕЦ: ./install-smtp/modules/06_ssl.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/02_firewall.sh ====================
+
+#!/usr/bin/env bash
+# 02_firewall.sh — базовый периметр через UFW: установка, правила, enable
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+fw::_yq() { yq -r "$1" "${VARS_FILE}"; }
+
+fw::vars() {
+  ACCEPT_INBOUND="$(fw::_yq '.accept_inbound // "true"')"   # true|false
+  # Почтовые порты (TCP). 25 — только если accept_inbound=true
+  MAIL_BASE=(465 587 993 995 80 443)
+}
+
+fw::ensure_ufw() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    log_info "UFW не найден — устанавливаю…"
+    run_cmd apt-get update -y
+    run_cmd DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+  fi
+}
+
+fw::detect_ssh_ports() {
+  # Собираем кандидаты портов SSH:
+  # 1) из sshd_config (Port …), включая несколько
+  # 2) из прослушивающих сокетов sshd
+  # 3) дефолт 22
+  declare -ag SSH_PORTS=()
+  local cfg="/etc/ssh/sshd_config"
+
+  if [[ -r "$cfg" ]]; then
+    # учитываем раскомментированные Port; игнорируем комменты/пустые
+    while read -r p; do
+      [[ -n "$p" ]] && SSH_PORTS+=("$p")
+    done < <(awk 'tolower($1)=="port"{print $2}' "$cfg" 2>/dev/null)
+  fi
+
+  # добираем из ss (если запущен sshd)
+  if command -v ss >/dev/null 2>&1; then
+    while read -r p; do
+      # формат вида ":::2222", "0.0.0.0:22"
+      p="${p##*:}"
+      [[ "$p" =~ ^[0-9]+$ ]] && SSH_PORTS+=("$p")
+    done < <(ss -lntp 2>/dev/null | awk '/sshd/ && /LISTEN/ {print $4}')
+  fi
+
+  # если пусто — 22
+  if [[ ${#SSH_PORTS[@]} -eq 0 ]]; then
+    SSH_PORTS=(22)
+  fi
+
+  # удалить дубли, отсортировать
+  mapfile -t SSH_PORTS < <(printf "%s\n" "${SSH_PORTS[@]}" | awk '!seen[$0]++' | sort -n)
+  log_info "SSH порты: ${SSH_PORTS[*]}"
+}
+
+fw::prepare_policy() {
+  # Если UFW не активен — чистый профиль
+  if ! ufw status | grep -qi 'Status: active'; then
+    run_cmd ufw --force reset
+    run_cmd ufw default deny incoming
+    run_cmd ufw default allow outgoing
+  fi
+}
+
+fw::apply_rules() {
+  # Разрешаем SSH порты в первую очередь (чтобы не отрезать доступ)
+  for p in "${SSH_PORTS[@]}"; do
+    run_cmd ufw allow "${p}/tcp"
+  done
+
+  # Почтовые/веб порты
+  local ports=("${MAIL_BASE[@]}")
+  if [[ "${ACCEPT_INBOUND}" == "true" ]]; then
+    ports=(25 "${ports[@]}")
+  else
+    log_info "ACCEPT_INBOUND=false → 25/tcp не открываем (внешняя доставка отключена)"
+  fi
+
+  for p in "${ports[@]}"; do
+    run_cmd ufw allow "${p}/tcp"
+  done
+}
+
+fw::enable() {
+  if ! ufw status | grep -qi 'Status: active'; then
+    run_cmd ufw --force enable
+    log_info "UFW включён."
+  else
+    log_info "UFW уже активен — правила обновлены."
+  fi
+  ufw status verbose || true
+}
+
+fw::sanity() {
+  # UFW должен быть активен
+  if ! ufw status | grep -qi 'Status: active'; then
+    log_error "UFW должен быть активен, но статус не active"
+    exit 1
+  fi
+
+  # Устойчиво проверяем, что SSH-порты разрешены:
+  # Парсим таблицу: колонки "To  Action  From". Важно сравнивать ровно поле $1 и $2.
+  local missing=0
+  local status
+  status="$(LC_ALL=C ufw status)" || status=""
+
+  for p in "${SSH_PORTS[@]}"; do
+    if ! awk -v want="${p}/tcp" '
+      # пропускаем заголовки
+      BEGIN{ok=0}
+      NR>=5 {
+        # строки вида: "22/tcp  ALLOW  Anywhere"
+        if ($1 == want && toupper($2) == "ALLOW") { ok=1; exit }
+      }
+      END{ exit (ok?0:1) }
+    ' <<<"$status"; then
+      log_error "Порт SSH ${p}/tcp не найден среди правил ALLOW UFW"
+      missing=1
+    fi
+  done
+
+  if [[ $missing -eq 0 ]]; then
+    log_info "Sanity: SSH порты разрешены."
+  else
+    # Не падаем жёстко: UFW уже активен и правила вероятно есть (разные локали/форматы могут ломать парсинг).
+    # Лишь предупреждаем и печатаем текущий статус для дебага.
+    log_warn "Проверь вручную вывод 'ufw status' — формат может отличаться."
+    echo "$status"
+  fi
+}
+
+module::main() {
+  fw::vars
+  fw::ensure_ufw
+  fw::detect_ssh_ports
+  fw::prepare_policy
+  fw::apply_rules
+  fw::enable
+  fw::sanity
+  log_info "Firewall: UFW настроен и активирован."
+}
+module::main "$@"
+
+==================== КОНЕЦ: ./install-smtp/modules/02_firewall.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/100_report.sh ====================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
+# Module: Финальный отчёт (ТОЛЬКО report.txt; manifest.json не трогаем)
+set -euo pipefail
+
+: "${VARS_FILE:?}"
+
+report::_yq(){ yq -r "$1" "${VARS_FILE}"; }
+
+report::vars() {
+  DOMAIN="$(report::_yq '.domain')"
+  HOSTNAME="$(report::_yq '.hostname // ("mail." + .domain)')"
+  IPV4="$(report::_yq '.ipv4')"
+  SELECTOR="$(report::_yq '.dkim_selector // "s1"')"
+}
+
+report::port_state() {
+  local p="$1"
+  if ss -ltn 2>/dev/null | grep -q "[:.]${p}[[:space:]]"; then
+    echo "open"; else echo "closed"; fi
+}
+
+report::dkim_value() {
+  local v=""
+  if [[ -f /var/local/msa/dkim.txt ]]; then
+    v="$(tr -d '\n' </var/local/msa/dkim.txt || true)"
+  fi
+  if [[ -z "$v" && -f "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" ]]; then
+    v="$(sed -e 's/[[:space:]]\+/ /g' -e 's/\"//g' "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" \
+       | tr -d '\n' | sed -E 's/.*TXT \(([^)]*)\).*/\1/' || true)"
+  fi
+  [[ -n "$v" ]] && printf '%s' "$v" || printf '<см. %s.txt в /etc/opendkim/keys/%s/>' "$SELECTOR" "$DOMAIN"
+}
+
+report::write() {
+  local P25 P465 P587 P993 P995 DKIM_VALUE DMARC_VALUE
+  P25="$(report::port_state 25)"
+  P465="$(report::port_state 465)"
+  P587="$(report::port_state 587)"
+  P993="$(report::port_state 993)"
+  P995="$(report::port_state 995)"
+  DKIM_VALUE="$(report::dkim_value)"
+  DMARC_VALUE="${DMARC_VALUE:-v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}}"
+
+  run_cmd install -d -m 0755 /var/local/msa
+  run_cmd install -m 0644 /dev/stdin /var/local/msa/report.txt <<EOF
+==== DNS, которые нужно добавить ====
+A     ${HOSTNAME}.                     ${IPV4}
+MX    ${DOMAIN}.                       10 ${HOSTNAME}.
+TXT   _dmarc.${DOMAIN}.                ${DMARC_VALUE}
+TXT   ${SELECTOR}._domainkey.${DOMAIN}.  ${DKIM_VALUE}
+
+[*] PTR/rDNS: у провайдера выставьте PTR для ${IPV4} → ${HOSTNAME}.
+
+==== Порты (локальный LISTEN) ====
+25=${P25}, 465=${P465}, 587=${P587}, 993=${P993}, 995=${P995}
+EOF
+  log_info "Отчёт записан: /var/local/msa/report.txt"
+}
+
+module::main() { report::vars; report::write; }
+module::main "$@"
+
+==================== КОНЕЦ: ./install-smtp/modules/100_report.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/05_dkim.sh ====================
+
+#!/usr/bin/env bash
+# Module 05_dkim.sh — OpenDKIM: ключи, таблицы, конфиг, systemd-override, интеграция с Postfix
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+dkim::_yq() { yq -r "$1" "${VARS_FILE}"; }
+
+dkim::vars() {
+  DOMAIN="$(dkim::_yq '.domain')"
+  SELECTOR="$(dkim::_yq '.dkim_selector // "s1"')"
+  HOSTNAME="$(dkim::_yq '.hostname // ("mail." + .domain)')"
+  IPV4="$(dkim::_yq '.ipv4')"
+  DKIM_SOCK="unix:/var/spool/postfix/opendkim/opendkim.sock"
+  DMARC_SOCK="unix:/var/spool/postfix/opendmarc/opendmarc.sock"
+  : "${DOMAIN:?}"; : "${SELECTOR:?}"; : "${HOSTNAME:?}"; : "${IPV4:?}"
+}
+
+dkim::prepare_dirs() {
+  run_cmd install -d -m 0750 -o opendkim -g opendkim "/etc/opendkim/keys/${DOMAIN}"
+  run_cmd install -d -m 0750 -o opendkim -g postfix /var/spool/postfix/opendkim
+}
+
+dkim::ensure_key() {
+  local dir="/etc/opendkim/keys/${DOMAIN}"
+  local priv="${dir}/${SELECTOR}.private"
+  if [[ ! -f "$priv" ]]; then
+    log_info "OpenDKIM: генерирую ключ 1024 бит (минимальный размер для TXT)"
+    run_cmd opendkim-genkey -b 1024 -s "${SELECTOR}" -d "${DOMAIN}" -D "${dir}"
+    run_cmd chown opendkim:opendkim "${dir}/${SELECTOR}.private" "${dir}/${SELECTOR}.txt"
+    run_cmd chmod 0600 "${dir}/${SELECTOR}.private"
+  fi
+}
+
+dkim::write_tables() {
+  # KeyTable: <keyname> <domain>:<selector>:<path_to_private_key>
+  # Ключевое имя = домен (переносимо и понятно)
+  printf '%s\n' \
+    "${DOMAIN} ${DOMAIN}:${SELECTOR}:/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private" \
+    | run_cmd install -D -m 0644 /dev/stdin /etc/opendkim/KeyTable
+
+  # SigningTable: обычный file:-маппинг без regex — универсально на всех сборках
+  {
+    printf '%s\t%s\n' "info@${DOMAIN}" "${DOMAIN}"
+    printf '%s\t%s\n' "@${DOMAIN}"      "${DOMAIN}"
+    printf '%s\t%s\n' "${DOMAIN}"       "${DOMAIN}"
+  } | run_cmd install -D -m 0644 /dev/stdin /etc/opendkim/SigningTable
+
+  # TrustedHosts
+  printf '%s\n' "127.0.0.1" "::1" "localhost" "${HOSTNAME}" "${IPV4}" \
+    | run_cmd install -D -m 0644 /dev/stdin /etc/opendkim/TrustedHosts
+
+  run_cmd chown opendkim:opendkim /etc/opendkim/{KeyTable,SigningTable,TrustedHosts}
+  run_cmd chmod 0644 /etc/opendkim/{KeyTable,SigningTable,TrustedHosts}
+}
+
+dkim::write_conf() {
+  cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/opendkim.conf
+Syslog                  yes
+LogWhy                  yes
+UMask                   007
+Mode                    sv
+AutoRestart             yes
+PidFile                 /run/opendkim/opendkim.pid
+
+Socket                  local:/var/spool/postfix/opendkim/opendkim.sock
+UserID                  opendkim:postfix
+
+KeyTable                file:/etc/opendkim/KeyTable
+SigningTable            file:/etc/opendkim/SigningTable
+InternalHosts           /etc/opendkim/TrustedHosts
+ExternalIgnoreList      /etc/opendkim/TrustedHosts
+
+Canonicalization        relaxed/simple
+MinimumKeyBits          1024
+OversignHeaders         From
+TrustAnchorFile         /usr/share/dns/root.key
+EOF
+}
+
+dkim::systemd_override() {
+  run_cmd install -d -m 0755 /etc/systemd/system/opendkim.service.d
+  cat <<'EOF' | run_cmd install -m 0644 /dev/stdin /etc/systemd/system/opendkim.service.d/override.conf
+[Service]
+User=opendkim
+Group=postfix
+UMask=007
+ReadWritePaths=/var/spool/postfix/opendkim
+ExecStart=
+ExecStart=/usr/sbin/opendkim -x /etc/opendkim.conf -P /run/opendkim/opendkim.pid -u opendkim -l
+EOF
+  run_cmd systemctl daemon-reload
+}
+
+dkim::wire_postfix() {
+  run_cmd postconf -e "milter_protocol=6"
+  run_cmd postconf -e "milter_default_action=accept"
+
+  local sockets="${DKIM_SOCK}"
+  [[ -S /var/spool/postfix/opendmarc/opendmarc.sock ]] && sockets="${sockets},${DMARC_SOCK}"
+
+  # впишем DKIM (и DMARC, если есть) в начало списка milters
+  local have; have="$(postconf -h smtpd_milters || true)"
+  if [[ -z "${have// }" ]]; then
+    have="${sockets}"
+  else
+    if ! grep -q 'opendkim/opendkim\.sock' <<<"${have}"; then
+      have="${DKIM_SOCK}${have:+,${have}}"
+    fi
+    if [[ "${sockets}" == *opendmarc* ]] && ! grep -q 'opendmarc/opendmarc\.sock' <<<"${have}"; then
+      have="${have},${DMARC_SOCK}"
+    fi
+  fi
+  run_cmd postconf -e "smtpd_milters=${have}"
+  run_cmd postconf -e "non_smtpd_milters=${have}"
+
+  run_cmd postconf -P "submission/inet/milter_macro_daemon_name=ORIGINATING"
+  run_cmd postconf -P "smtps/inet/milter_macro_daemon_name=ORIGINATING"
+  run_cmd postconf -P "submission/inet/smtpd_milters=${sockets}"
+  run_cmd postconf -P "smtps/inet/smtpd_milters=${sockets}"
+
+  run_cmd systemctl reload postfix || run_cmd systemctl restart postfix
+}
+
+dkim::restart_and_export_txt() {
+  run_cmd systemctl enable --now opendkim
+  run_cmd systemctl restart opendkim
+
+  run_cmd install -d -m 0755 /var/local/msa
+  run_cmd install -m 0644 "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" /var/local/msa/dkim.txt
+  log_info "OpenDKIM: TXT экспортирован в /var/local/msa/dkim.txt"
+}
+
+dkim::sanity() {
+  # доступ postfix к сокету
+  sudo -u postfix test -w /var/spool/postfix/opendkim/opendkim.sock || {
+    log_error "postfix не имеет доступа к opendkim.sock"
+    exit 1
+  }
+  # быстрый смок: нет ли в логах fresh 'no signing table match'
+  if journalctl -u opendkim --since -5min 2>/dev/null | grep -qi 'no signing table match'; then
+    log_error "OpenDKIM: обнаружен 'no signing table match' за последние 5 минут"
+    exit 1
+  fi
+  log_info "OpenDKIM sanity ok"
+}
+
+module::main() {
+  dkim::vars
+  log_info "OpenDKIM: настройка (selector=${SELECTOR}, domain=${DOMAIN})"
+  dkim::prepare_dirs
+  dkim::ensure_key
+  dkim::write_tables
+  dkim::write_conf
+  dkim::systemd_override
+  dkim::wire_postfix
+  dkim::restart_and_export_txt
+  dkim::sanity
+  log_info "OpenDKIM готов. Проверка: opendkim-testkey -d ${DOMAIN} -s ${SELECTOR} -vvv"
+}
+module::main "$@"
+
+==================== КОНЕЦ: ./install-smtp/modules/05_dkim.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/99_healthcheck.sh ====================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
+# Module: Dovecot passwd-file + SMTP AUTH + Maildir и первичная инициализация
+set -euo pipefail
+
+: "${VARS_FILE:?}"
+
+dovecot::_yq() { yq -r "$1" "${VARS_FILE}"; }
+
+dovecot::ensure_passdb_dir() {
+  run_cmd install -d -m 0750 -o root -g dovecot /etc/dovecot/passdb
+}
+
+dovecot::render_passdb_from_vars() {
+  local users_file=/etc/dovecot/passdb/users
+  : >"$users_file"
+  while IFS=$'\t' read -r LOGIN PASSWORD; do
+    [[ -n "${LOGIN:-}" && -n "${PASSWORD:-}" ]] || continue
+    local HASH; HASH="$(doveadm pw -s SHA512-CRYPT -p "$PASSWORD")"
+    printf '%s:%s\n' "$LOGIN" "$HASH" >>"$users_file"
+  done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
+  run_cmd chown root:dovecot "$users_file"
+  run_cmd chmod 0640 "$users_file"
+}
+
+dovecot::enable_passwdfile_auth() {
+  run_cmd sed -i 's/^!include[[:space:]]\+auth-system\.conf\.ext/#!include auth-system.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
+  run_cmd sed -i 's/^#\s*!include[[:space:]]\+auth-passwdfile\.conf\.ext/!include auth-passwdfile.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
+
+  local cfg=/etc/dovecot/conf.d/auth-passwdfile.conf.ext
+  local desired; desired="$(cat <<'EOF'
+passdb {
+  driver = passwd-file
+  args = scheme=SHA512-CRYPT username_format=%u /etc/dovecot/passdb/users
+}
+userdb {
+  driver = static
+  args = uid=vmail gid=vmail home=/var/vmail/%d/%n
+}
+EOF
+)"
+  if ! cmp -s <(printf '%s' "$desired") "$cfg" 2>/dev/null; then
+    log_info "Dovecot: обновляю $cfg"
+    printf '%s' "$desired" | run_cmd install -D -m 0644 /dev/stdin "$cfg"
+  fi
+}
+
+dovecot::postfix_auth_socket() {
+  local cfg=/etc/dovecot/conf.d/90-postfix-auth.conf
+  local desired; desired="$(cat <<'EOF'
+auth_mechanisms = plain login
+disable_plaintext_auth = yes
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    user = postfix
+    group = postfix
+    mode = 0660
+  }
+}
+EOF
+)"
+  if ! cmp -s <(printf '%s' "$desired") "$cfg" 2>/dev/null; then
+    log_info "Dovecot: пишу $cfg"
+    printf '%s' "$desired" | run_cmd install -D -m 0644 /dev/stdin "$cfg"
+  fi
+  run_cmd install -d -m 0750 -o postfix -g postfix /var/spool/postfix/private
+}
+
+dovecot::ensure_mail_location() {
+  if ! dovecot -n 2>/dev/null | grep -q '^mail_location ='; then
+    log_info "Dovecot: задаю mail_location (Maildir)"
+    cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-maildir.conf
+mail_location = maildir:/var/vmail/%d/%n/Maildir
+protocols = imap lmtp sieve pop3
+EOF
+  fi
+}
+
+dovecot::init_maildirs_and_inbox() {
+  # создаём каталоги и INBOX для всех пользователей
+  while IFS=$'\t' read -r LOGIN _; do
+    [[ -n "${LOGIN:-}" ]] || continue
+    local d="/var/vmail/${LOGIN#*@}/${LOGIN%@*}"
+    run_cmd install -d -m 0750 -o vmail -g vmail "$d/Maildir"/{cur,new,tmp}
+    # создаём INBOX через doveadm (не падаем, если уже есть)
+    if ! doveadm mailbox list -u "$LOGIN" >/dev/null 2>&1; then
+      :
+    fi
+    doveadm mailbox create -u "$LOGIN" INBOX >/dev/null 2>&1 || true
+    log_info "Dovecot: подготовлен Maildir для ${LOGIN}"
+  done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
+}
+
+dovecot::restart_and_selftest() {
+  run_cmd systemctl enable --now dovecot
+  run_cmd systemctl restart dovecot
+
+  local u p
+  u="$(dovecot::_yq '.users[0].login')"
+  p="$(dovecot::_yq '.users[0].password')"
+  if doveadm auth test -x service=smtp "$u" "$p" >/dev/null 2>&1; then
+    log_info "Dovecot: SMTP AUTH OK (${u})"
+  else
+    log_warn "Dovecot: SMTP AUTH FAIL (${u}) — см. /var/log/mail.log"
+  fi
+}
+
+module::main() {
+  dovecot::ensure_passdb_dir
+  dovecot::render_passdb_from_vars
+  dovecot::enable_passwdfile_auth
+  dovecot::postfix_auth_socket
+  dovecot::ensure_mail_location
+  dovecot::init_maildirs_and_inbox
+  dovecot::restart_and_selftest
+}
+
+module::main "$@"
+
+==================== КОНЕЦ: ./install-smtp/modules/99_healthcheck.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/03_postfix.sh ====================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+_log() { printf '[%(%FT%TZ)T] [%s] %s\n' -1 "$1" "$2"; }
+INFO(){ _log INFO "$*"; }
+WARN(){ _log WARN "$*"; }
+ERROR(){ _log ERROR "$*"; }
+
+: "${DOMAIN:?}"
+: "${HOSTNAME:?}"
+: "${IPV4:?}"
+
+INFO "Пишу /etc/mailname = ${HOSTNAME}"
+printf '%s\n' "${HOSTNAME}" | tee /etc/mailname >/dev/null
+
+INFO "Postfix: базовая конфигурация и TLS-жёсткость (TLS1.2+)"
+postconf -e myhostname="${HOSTNAME}"
+postconf -e myorigin="${DOMAIN}"
+postconf -e inet_interfaces=all
+postconf -e inet_protocols=ipv4
+postconf -e smtp_address_preference=ipv4
+postconf -e smtp_bind_address="${IPV4}"
+postconf -e smtpd_banner='$myhostname ESMTP'
+postconf -e smtpd_sasl_type=dovecot
+postconf -e smtpd_sasl_path=private/auth
+postconf -e smtpd_sasl_auth_enable=yes
+postconf -e smtpd_recipient_restrictions='permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination'
+postconf -e mynetworks='127.0.0.0/8'
+postconf -e smtpd_tls_auth_only=yes
+postconf -e smtpd_tls_security_level=may
+postconf -e smtp_tls_security_level=may
+postconf -e smtpd_tls_protocols='!SSLv2, !SSLv3, !TLSv1, !TLSv1.1'
+postconf -e smtp_tls_protocols='!SSLv2, !SSLv3, !TLSv1, !TLSv1.1'
+postconf -e tls_preempt_cipherlist=yes
+postconf -e smtpd_tls_ciphers=high
+postconf -e smtp_tls_ciphers=high
+postconf -e smtpd_tls_mandatory_ciphers=high
+
+# виртуальные ящики (карта может быть пустой — это ок)
+install -m 0644 /dev/stdin /etc/postfix/virtual_mailbox_maps <<<""
+postmap hash:/etc/postfix/virtual_mailbox_maps
+postconf -e virtual_mailbox_maps='hash:/etc/postfix/virtual_mailbox_maps'
+
+# master.cf: явно включаем три сервиса. На некоторых образах по умолчанию postscreen — уберём.
+postconf -X smtp/inet || true
+postconf -M smtp/inet="smtp inet n - n - - smtpd"
+
+postconf -X submission/inet || true
+postconf -M submission/inet="submission inet n - n - - smtpd"
+postconf -P submission/inet/smtpd_tls_security_level=encrypt
+postconf -P submission/inet/smtpd_sasl_auth_enable=yes
+postconf -P submission/inet/smtpd_client_restrictions="permit_sasl_authenticated,reject"
+
+postconf -X smtps/inet || true
+postconf -M smtps/inet="smtps inet n - n - - smtpd"
+postconf -P smtps/inet/smtpd_tls_wrappermode=yes
+postconf -P smtps/inet/smtpd_sasl_auth_enable=yes
+postconf -P smtps/inet/smtpd_client_restrictions="permit_sasl_authenticated,reject"
+
+INFO "Postfix: включаю сервис и перезапускаю"
+systemctl enable --now postfix
+systemctl restart postfix
+
+# ждём порты до 10 сек
+ok25=0 ok465=0 ok587=0
+for i in {1..10}; do
+  ss -ltn 2>/dev/null | grep -qE '[:.]25[[:space:]]'  && ok25=1 || true
+  ss -ltn 2>/dev/null | grep -qE '[:.]465[[:space:]]' && ok465=1 || true
+  ss -ltn 2>/dev/null | grep -qE '[:.]587[[:space:]]' && ok587=1 || true
+  (( ok25 && ok465 && ok587 )) && break
+  sleep 1
+done
+
+if ! (( ok25 ));  then WARN "порт 25 — НЕ слушается";  fi
+if ! (( ok465 )); then WARN "порт 465 — НЕ слушается"; fi
+if ! (( ok587 )); then WARN "порт 587 — НЕ слушается"; fi
+
+if ! (( ok25 && ok465 && ok587 )); then
+  ERROR "Postfix: после рестарта не поднялись все порты. Логи ниже:"
+  journalctl -u postfix -n 200 --no-pager -o cat || true
+  exit 1
+fi
+
+==================== КОНЕЦ: ./install-smtp/modules/03_postfix.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/04_dovecot.sh ====================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
+# Module: Dovecot passwd-file + SMTP AUTH + Maildir и первичная инициализация
+set -euo pipefail
+
+: "${VARS_FILE:?}"
+
+dovecot::_yq() { yq -r "$1" "${VARS_FILE}"; }
+
+dovecot::ensure_passdb_dir() {
+  run_cmd install -d -m 0750 -o root -g dovecot /etc/dovecot/passdb
+}
+
+dovecot::render_passdb_from_vars() {
+  local users_file=/etc/dovecot/passdb/users
+  : >"$users_file"
+  while IFS=$'\t' read -r LOGIN PASSWORD; do
+    [[ -n "${LOGIN:-}" && -n "${PASSWORD:-}" ]] || continue
+    local HASH; HASH="$(doveadm pw -s SHA512-CRYPT -p "$PASSWORD")"
+    printf '%s:%s\n' "$LOGIN" "$HASH" >>"$users_file"
+  done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
+  run_cmd chown root:dovecot "$users_file"
+  run_cmd chmod 0640 "$users_file"
+}
+
+dovecot::enable_passwdfile_auth() {
+  run_cmd sed -i 's/^!include[[:space:]]\+auth-system\.conf\.ext/#!include auth-system.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
+  run_cmd sed -i 's/^#\s*!include[[:space:]]\+auth-passwdfile\.conf\.ext/!include auth-passwdfile.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
+
+  local cfg=/etc/dovecot/conf.d/auth-passwdfile.conf.ext
+  local desired; desired="$(cat <<'EOF'
+passdb {
+  driver = passwd-file
+  args = scheme=SHA512-CRYPT username_format=%u /etc/dovecot/passdb/users
+}
+userdb {
+  driver = static
+  args = uid=vmail gid=vmail home=/var/vmail/%d/%n
+}
+EOF
+)"
+  if ! cmp -s <(printf '%s' "$desired") "$cfg" 2>/dev/null; then
+    log_info "Dovecot: обновляю $cfg"
+    printf '%s' "$desired" | run_cmd install -D -m 0644 /dev/stdin "$cfg"
+  fi
+}
+
+dovecot::postfix_auth_socket() {
+  local cfg=/etc/dovecot/conf.d/90-postfix-auth.conf
+  local desired; desired="$(cat <<'EOF'
+auth_mechanisms = plain login
+disable_plaintext_auth = yes
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    user = postfix
+    group = postfix
+    mode = 0660
+  }
+}
+EOF
+)"
+  if ! cmp -s <(printf '%s' "$desired") "$cfg" 2>/dev/null; then
+    log_info "Dovecot: пишу $cfg"
+    printf '%s' "$desired" | run_cmd install -D -m 0644 /dev/stdin "$cfg"
+  fi
+  run_cmd install -d -m 0750 -o postfix -g postfix /var/spool/postfix/private
+}
+
+dovecot::ensure_mail_location() {
+  if ! dovecot -n 2>/dev/null | grep -q '^mail_location ='; then
+    log_info "Dovecot: задаю mail_location (Maildir)"
+    cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-maildir.conf
+mail_location = maildir:/var/vmail/%d/%n/Maildir
+protocols = imap lmtp sieve pop3
+EOF
+  fi
+}
+
+dovecot::init_maildirs_and_inbox() {
+  # создаём каталоги и INBOX для всех пользователей
+  while IFS=$'\t' read -r LOGIN _; do
+    [[ -n "${LOGIN:-}" ]] || continue
+    local d="/var/vmail/${LOGIN#*@}/${LOGIN%@*}"
+    run_cmd install -d -m 0750 -o vmail -g vmail "$d/Maildir"/{cur,new,tmp}
+    # создаём INBOX через doveadm (не падаем, если уже есть)
+    if ! doveadm mailbox list -u "$LOGIN" >/dev/null 2>&1; then
+      :
+    fi
+    doveadm mailbox create -u "$LOGIN" INBOX >/dev/null 2>&1 || true
+    log_info "Dovecot: подготовлен Maildir для ${LOGIN}"
+  done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
+}
+
+dovecot::restart_and_selftest() {
+  run_cmd systemctl enable --now dovecot
+  run_cmd systemctl restart dovecot
+
+  local u p
+  u="$(dovecot::_yq '.users[0].login')"
+  p="$(dovecot::_yq '.users[0].password')"
+  if doveadm auth test -x service=smtp "$u" "$p" >/dev/null 2>&1; then
+    log_info "Dovecot: SMTP AUTH OK (${u})"
+  else
+    log_warn "Dovecot: SMTP AUTH FAIL (${u}) — см. /var/log/mail.log"
+  fi
+}
+
+module::main() {
+  dovecot::ensure_passdb_dir
+  dovecot::render_passdb_from_vars
+  dovecot::enable_passwdfile_auth
+  dovecot::postfix_auth_socket
+  dovecot::ensure_mail_location
+  dovecot::init_maildirs_and_inbox
+  dovecot::restart_and_selftest
+}
+
+module::main "$@"
+
+==================== КОНЕЦ: ./install-smtp/modules/04_dovecot.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/08_opendmarc.sh ====================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+# modules/08_opendmarc.sh — OpenDMARC milter
+# shellcheck shell=bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+opendmarc::write_conf() {
+  local cfg="/etc/opendmarc.conf" tmp; tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+# Generated by install-smtp
+AuthservID ${HOSTNAME}
+TrustedAuthservIDs ${HOSTNAME}
+Socket local:/var/spool/postfix/opendmarc/opendmarc.sock
+UserID opendmarc
+UMask 007
+Syslog true
+SoftwareHeader true
+PidFile /run/opendmarc/opendmarc.pid
+RejectFailures false
+EOF
+  run_cmd install -m 0644 "$tmp" "$cfg"; rm -f "$tmp"
+}
+
+opendmarc::prepare_paths() {
+  run_cmd install -d -m 0755 -o opendmarc -g opendmarc /run/opendmarc
+  run_cmd install -d -m 0750 -o opendmarc -g postfix /var/spool/postfix/opendmarc
+}
+
+opendmarc::systemd_override() {
+  run_cmd install -d -m 0755 /etc/systemd/system/opendmarc.service.d
+  local ovr="/etc/systemd/system/opendmarc.service.d/override.conf" tmp; tmp="$(mktemp)"
+  cat >"$tmp" <<'EOF'
+[Service]
+RuntimeDirectory=opendmarc
+RuntimeDirectoryMode=0755
+User=opendmarc
+Group=opendmarc
+ExecStart=
+ExecStart=/usr/sbin/opendmarc -c /etc/opendmarc.conf -l
+EOF
+  run_cmd install -m 0644 "$tmp" "$ovr"; rm -f "$tmp"
+  run_cmd systemctl daemon-reload
+}
+
+opendmarc::wire_postfix() {
+  local want="unix:/var/spool/postfix/opendmarc/opendmarc.sock"
+  local cur
+  cur="$(postconf -h smtpd_milters || true)"
+  [[ "$cur" == *"/opendmarc/opendmarc.sock"* ]] || run_cmd postconf -e "smtpd_milters=${cur:+$cur,}$want"
+  cur="$(postconf -h non_smtpd_milters || true)"
+  [[ "$cur" == *"/opendmarc/opendmarc.sock"* ]] || run_cmd postconf -e "non_smtpd_milters=${cur:+$cur,}$want"
+  run_cmd postconf -e "milter_default_action=accept"
+  run_cmd postconf -e "milter_protocol=6"
+}
+
+opendmarc::restart() {
+  run_cmd systemctl enable --now opendmarc
+  run_cmd systemctl restart opendmarc
+}
+
+# ENTRYPOINT
+log_info "OpenDMARC: настраиваю milter и сервис"
+opendmarc::write_conf
+opendmarc::prepare_paths
+opendmarc::systemd_override
+opendmarc::wire_postfix
+opendmarc::restart
+
+==================== КОНЕЦ: ./install-smtp/modules/08_opendmarc.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/07_fail2ban.sh ====================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+#!/usr/bin/env bash
+# Module: Fail2ban jails + postfix-sasl filter + адаптивный banaction (функции + entrypoint)
+set -euo pipefail
+
+
+f2b::_detect_banaction() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'active'; then
+    echo "ufw"
+  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+    echo "firewallcmd-rich-rules"
+  elif command -v iptables >/dev/null 2>&1; then
+    echo "iptables-multiport"
+  elif command -v nft >/dev/null 2>&1; then
+    echo "nftables"
+  else
+    echo "iptables-multiport"  # разумный дефолт
+  fi
+}
+
+f2b::write_global_ipv6_off() {
+  log_info "Fail2ban: выключаю IPv6 (allowipv6 = no)"
+  run_cmd install -D -m 0644 /dev/stdin /etc/fail2ban/fail2ban.local <<'CONF'
+[Definition]
+allowipv6 = no
+CONF
+}
+
+f2b::ensure_filter_postfix_sasl() {
+  local f="/etc/fail2ban/filter.d/postfix-sasl.conf"
+  if [[ ! -f "$f" ]]; then
+    log_info "Fail2ban: создаю фильтр postfix-sasl.conf"
+    run_cmd install -D -m 0644 /dev/stdin "$f" <<'CONF'
+[Definition]
+failregex = (?i)postfix/smtpd\[\d+\]:\s+warning:\s+[-\w\.:]+\[<HOST>\]:\s+SASL (?:LOGIN|PLAIN|AUTH) authentication failed: .*
+            (?i)authentication failure;.*\bSASL\b.*user=<[^>]*>.*rip=<HOST>
+ignoreregex =
+CONF
+  fi
+}
+
+f2b::write_jails() {
+  local banaction; banaction="$(f2b::_detect_banaction)"
+  log_info "Fail2ban: banaction=${banaction}"
+  run_cmd install -D -m 0644 /dev/stdin /etc/fail2ban/jail.d/msa-mail.conf <<CONF
+[DEFAULT]
+backend = auto
+banaction = ${banaction}
+findtime = 10m
+maxretry = 5
+bantime = 1h
+ignoreip = 127.0.0.1/8
+
+[postfix]
+enabled = true
+filter  = postfix
+port    = smtp,submission,465
+logpath = /var/log/mail.log
+
+[postfix-sasl]
+enabled = true
+filter  = postfix-sasl
+port    = smtp,submission,465
+logpath = /var/log/mail.log
+
+[dovecot]
+enabled = true
+filter  = dovecot
+port    = imap,imaps,pop3,pop3s
+logpath = /var/log/mail.log
+CONF
+}
+
+f2b::reload() {
+  log_info "Fail2ban: включаю сервис и перегружаю конфиг"
+  run_cmd systemctl enable --now fail2ban
+  run_cmd fail2ban-client reload
+}
+
+module::main() {
+  f2b::write_global_ipv6_off
+  f2b::ensure_filter_postfix_sasl
+  f2b::write_jails
+  f2b::reload
+}
+module::main "$@"
+
+==================== КОНЕЦ: ./install-smtp/modules/07_fail2ban.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/02_pre_dns.sh ====================
+
+#!/usr/bin/env bash
+# 02_pre_dns.sh — ранняя DNS-подготовка: A(@) и A(mail) на нужный IP через Beget API.
+# НИКАКИЕ MX/TXT и т.п. не трогаем. Никакой рекурсии в 09_* не делаем.
+# Требуются переменные из install.sh: DOMAIN, HOSTNAME, IPV4, VARS_FILE. Нужны: curl, dig, yq v4.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+_log() { printf '[%(%FT%TZ)T] [%s] %s\n' -1 "$1" "$2"; }
+INFO(){ _log INFO "$*"; }
+WARN(){ _log WARN "$*"; }
+ERROR(){ _log ERROR "$*"; }
+
+: "${DOMAIN:?DOMAIN is required}"
+: "${HOSTNAME:?HOSTNAME is required}"
+: "${IPV4:?IPV4 is required}"
+: "${VARS_FILE:?VARS_FILE is required}"
+
+# Читаем креды и TTL из vars.yaml (mikefarah/yq v4)
+BEGET_LOGIN="${BEGET_LOGIN:-$(yq -r '.beget.login // ""'    "$VARS_FILE" 2>/dev/null || true)}"
+BEGET_PASSWORD="${BEGET_PASSWORD:-$(yq -r '.beget.password // ""' "$VARS_FILE" 2>/dev/null || true)}"
+TTL_DEFAULT="$(yq -r '.dns_update.ttl_default // ""' "$VARS_FILE" 2>/dev/null || true)"
+[[ "$TTL_DEFAULT" == "null" ]] && TTL_DEFAULT=""
+
+have_beget_creds() { [[ -n "$BEGET_LOGIN" && -n "$BEGET_PASSWORD" ]]; }
+
+beget_api() {
+  # $1 = endpoint (getData|changeRecords), $2 = compact JSON input_data
+  local endpoint="$1" input_data_json="$2"
+  if ! have_beget_creds; then
+    WARN "Beget API: креды не заданы — пропускаю вызов ${endpoint}"
+    return 2
+  fi
+  curl -fsS -X POST "https://api.beget.com/api/dns/${endpoint}" \
+    -d "login=${BEGET_LOGIN}" \
+    -d "passwd=${BEGET_PASSWORD}" \
+    -d "input_format=json" \
+    --data-urlencode "input_data=${input_data_json}"
+}
+
+get_records() {
+  # payload строго как в 09_*: {"fqdn":"example.com"}
+  local fqdn="$1"
+  beget_api "getData" "{\"fqdn\":\"${fqdn}\"}" || true
+}
+
+change_a_records() {
+  # payload строго как в 09_*: {"fqdn":"...","records":{"A":[{"value":"IP","ttl":N}]}}
+  local fqdn="$1" ip="$2" ttl="$3"
+  local rec
+  if [[ -n "$ttl" ]]; then
+    rec="{\"A\":[{\"value\":\"${ip}\",\"ttl\":${ttl}}]}"
+  else
+    rec="{\"A\":[{\"value\":\"${ip}\"}]}"
+  fi
+  beget_api "changeRecords" "{\"fqdn\":\"${fqdn}\",\"records\":${rec}}" || true
+}
+
+ensure_a_record() {
+  local fqdn="$1" want_ip="$2" ttl="$3"
+
+  INFO "Ранняя DNS: проверяю A(${fqdn})"
+  local pub_ip
+  pub_ip="$(dig +short A "${fqdn}" @8.8.8.8 | head -n1 || true)"
+
+  if [[ "$pub_ip" == "$want_ip" ]]; then
+    INFO "A(${fqdn}) уже указывает на ${want_ip} — ок"
+    return 0
+  fi
+
+  if ! have_beget_creds; then
+    WARN "A(${fqdn}) != ${want_ip}, но кред Бегета не заданы — оставляю как есть"
+    return 0
+  fi
+
+  # Для логов — убедимся, что домен реально у Бегета
+  local resp status
+  resp="$(get_records "$fqdn")" || true
+  status="$(printf '%s' "$resp" | yq -p=json -r '.answer.status // "error"' 2>/dev/null || echo error)"
+  if [[ "$status" != "success" ]]; then
+    WARN "Beget getData(${fqdn}) => error; всё равно попытаюсь сменить A"
+  fi
+
+  local ch ch_status err
+  ch="$(change_a_records "$fqdn" "$want_ip" "$ttl")" || true
+  ch_status="$(printf '%s' "$ch" | yq -p=json -r '.answer.status // "error"' 2>/dev/null || echo error)"
+
+  if [[ "$ch_status" != "success" ]]; then
+    err="$(printf '%s' "$ch" | yq -p=json -o=yaml '.answer.errors // .answer' 2>/dev/null || true)"
+    ERROR "Не удалось применить A(${fqdn}) → ${want_ip}: ${err}"
+    return 1
+  fi
+
+  INFO "A(${fqdn}) → ${want_ip} отправлено через API Бегета"
+  return 0
+}
+
+main() {
+  INFO "Ранняя DNS-подготовка: приводим A(@) и A(${HOSTNAME}) к ${IPV4}"
+  ensure_a_record "${DOMAIN}"   "${IPV4}" "${TTL_DEFAULT}" || true
+  ensure_a_record "${HOSTNAME}" "${IPV4}" "${TTL_DEFAULT}" || true
+}
+
+main "$@"
+
+==================== КОНЕЦ: ./install-smtp/modules/02_pre_dns.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/01_prepare.sh ====================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:?}"
+
+# modules/01_prepare.sh — подготовка системы (пакеты, vmail, IPv6-off)
+# shellcheck shell=bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+prepare::system_packages() {
+  log_info "Обновляю индекс пакетов и ставлю базовые зависимости"
+  run_cmd apt-get update
+
+  # Базовый набор пакетов
+  local -a pkgs=(
+    postfix
+    dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-sieve dovecot-managesieved
+    opendkim opendkim-tools opendmarc
+    fail2ban certbot
+    rsyslog ca-certificates curl gnupg
+    dnsutils iproute2 lsof
+  )
+
+  # Добросим postfix-pcre при наличии в репах
+  pkg_available() { apt-cache show "$1" >/dev/null 2>&1; }
+  if pkg_available postfix-pcre; then
+    pkgs+=(postfix-pcre)
+  fi
+
+  log_info "Устанавливаю пакеты (${#pkgs[@]}): ${pkgs[*]}"
+
+  # Жёстко через env → исключаем нюансы run_cmd/IFS
+  if ! /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+        APT_LISTCHANGES_FRONTEND=none \
+        UCF_FORCE_CONFOLD=1 \
+        apt-get -y install --no-install-recommends "${pkgs[@]}"; then
+    log_warn "Первый apt-get install завершился ошибкой — пробую apt-get -f install и повтор"
+    /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get -f -y install
+    /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+      APT_LISTCHANGES_FRONTEND=none \
+      UCF_FORCE_CONFOLD=1 \
+      apt-get -y install --no-install-recommends "${pkgs[@]}"
+  fi
+}
+
+prepare::create_vmail_user() {
+  if ! getent group vmail >/dev/null 2>&1; then
+    run_cmd groupadd --system vmail
+  fi
+  if ! id -u vmail >/dev/null 2>&1; then
+    if command -v nologin >/dev/null 2>&1; then
+      run_cmd useradd -r -g vmail -d /var/vmail -s /usr/sbin/nologin vmail
+    else
+      run_cmd useradd -r -g vmail -d /var/vmail -s /bin/false vmail
+    fi
+  fi
+  run_cmd install -d -m 0750 -o vmail -g vmail /var/vmail
+}
+
+# Жёстко отключаем IPv6 на уровне ядра — для предсказуемости исходящих
+prepare::disable_ipv6() {
+  log_info "Отключаю IPv6 на уровне ядра (sysctl)"
+  local conf="/etc/sysctl.d/98-msa-disable-ipv6.conf"
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<'EOF'
+# Disabled by msa-installer to ensure IPv4-only routing
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+  run_cmd install -m 0644 "$tmp" "$conf"
+  rm -f "$tmp"
+  run_cmd sysctl -p "$conf"
+}
+
+prepare::add_postfix_to_milter_groups() {
+  log_info "Добавляю пользователя postfix в группы opendkim и opendmarc для доступа к сокетам"
+  run_cmd usermod -a -G opendkim postfix
+  run_cmd usermod -a -G opendmarc postfix
+}
+
+
+# --- ENTRYPOINT ---
+prepare::system_packages
+prepare::create_vmail_user
+prepare::disable_ipv6
+prepare::add_postfix_to_milter_groups
+
+==================== КОНЕЦ: ./install-smtp/modules/01_prepare.sh ======================
+
+
+==================== НАЧАЛО: ./install-smtp/modules/09_beget_dns.sh ====================
+
+#!/usr/bin/env bash
+# 09_beget_dns.sh — авто-деплой DNS в Beget с нормализацией DKIM TXT
+# Логика:
+# - читаем vars.yaml и /var/local/msa/dkim.txt
+# - проверяем делегирование NS → Beget
+# - формируем desired:
+#     A:  mail.<domain> → ipv4
+#     MX: @ → 10 mail.<domain>
+#     SPF: @ → merge/append v=spf1 (вставляем a:mail.<domain> если нужно)
+#     DKIM: sX._domainkey.<domain> → нормализованный TXT
+#     DMARC: _dmarc.<domain> → v=DMARC1; p=none; rua=mailto:<ПЕРВЫЙ_USER_EMAIL|hostmaster@>
+# - применяем через changeRecords
+# - верифицируем через публичный DNS
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "${MOD_DIR}/../lib/common.sh"
+: "${VARS_FILE:=${MOD_DIR}/../vars.yaml}"
+if [[ ! -r "$VARS_FILE" ]]; then
+  log_error "VARS_FILE не найден: $VARS_FILE"; exit 1
+fi
+MSA_STATE_DIR="${MSA_STATE_DIR:-/var/local/msa}"
+MSA_MANIFEST="${MSA_MANIFEST:-$MSA_STATE_DIR/manifest.json}"
+MSA_DKIM_TXT="${MSA_DKIM_TXT:-$MSA_STATE_DIR/dkim.txt}"
+
+# ---------- опции ----------
+TTL_DEFAULT="${TTL_DEFAULT:-3600}"               # информативно (Beget сам расставит)
+SPF_POLICY="${SPF_POLICY:-warn}"                 # warn|append
+DNS_DRY_RUN="${DNS_DRY_RUN:-false}"             # --dry-run активирует
+DMARC_MODE="${DMARC_MODE:-ifabsent}"            # ifabsent|force
+# чистка дефолтов Бегета
+CLEAN_BEGET_DEFAULTS="${CLEAN_BEGET_DEFAULTS:-true}"   # true|false
+# что делать с autoconfig/autodiscover, если удалить нельзя
+BEGET_AUTOCONFIG_MODE="${BEGET_AUTOCONFIG_MODE:-cname}"  # delete|cname
+
+# чистка дефолтов Бегета
+CLEAN_BEGET_DEFAULTS="${CLEAN_BEGET_DEFAULTS:-true}"   # true|false
+# что делать с autoconfig/autodiscover, если удалить нельзя
+BEGET_AUTOCONFIG_MODE="${BEGET_AUTOCONFIG_MODE:-cname}"  # delete|cname
+
+
+# ---------- deps ----------
+dns::need() {
+  for b in curl jq yq dig; do
+    if ! command -v "$b" >/dev/null 2>&1; then
+      run_cmd apt-get update -y
+      run_cmd DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends dnsutils jq yq curl
+      break
+    fi
+  done
+}
+
+# ---------- utils ----------
+dns::_yq() { yq -r "$1 // \"\"" "$VARS_FILE" 2>/dev/null; }
+dns::manifest_get() { [[ -f "$MSA_MANIFEST" ]] || { echo ""; return 0; }; jq -r "$1 // empty" "$MSA_MANIFEST" 2>/dev/null || true; }
+dns::trimdot(){ local s="${1:-}"; s="${s%.}"; printf '%s' "$s"; }
+
+# склейка DKIM TXT из зонного формата в плоскую строку
+dns::sanitize_dkim_value() {
+  tr -d '\r' \
+  | sed -e 's/;.*$//' \
+        -e 's/^[[:space:]]*[^"]*"//' \
+        -e 's/"[[:space:]]*"[[:space:]]*/ /g' \
+        -e 's/"[[:space:]]*)[[:space:]]*$//' \
+        -e 's/^[[:space:]]*(//; s/)[[:space:]]*$//' \
+        -e 's/\\"/"/g' \
+        -e 's/\\//g' \
+  | tr -d '\n\t' \
+  | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+# merge SPF: если уже есть v=spf1 — аккуратно вставим a:mail.<domain> перед all
+dns::merge_spf() {
+  local spf="$1" host="$2"
+  if [[ -z "$spf" ]]; then echo "v=spf1 mx a:${host} ~all"; return; fi
+  if grep -qiE "(^|[[:space:]])a:${host}([[:space:]]|$)" <<<"$spf"; then echo "$spf"; return; fi
+  if grep -qiE '[[:space:]][~\-\?+]?all([[:space:]]|$)' <<<"$spf"; then
+    sed -E "s/[[:space:]]([~\\-\\?\\+]?all)([[:space:]]|$)/ a:${host} \\1\\2/I" <<<"$spf"
+  else
+    echo "$spf a:${host}"
+  fi
+}
+
+# payload → JSON для Beget changeRecords
+dns::mk_payload(){
+  local a_lines="$1" mx_lines="$2" txt_lines="$3"
+  local ja jmx jtxt
+  ja="$(printf '%s\n' "$a_lines"  | jq -Rsc 'split("\n")|map(select(length>0))')"
+  jmx="$(printf '%s\n' "$mx_lines" | jq -Rsc 'split("\n")|map(select(length>0))')"
+  jtxt="$(printf '%s\n' "$txt_lines"| jq -Rsc 'split("\n")|map(select(length>0))')"
+  jq -nc --argjson A "$ja" --argjson MX "$jmx" --argjson TXT "$jtxt" '
+    {}
+    | (if ($A|length)>0  then .A  = [ range(0; $A|length)  as $i | {priority:(($i+1)*10), value: $A[$i]} ]  else . end)
+    | (if ($MX|length)>0 then .MX = [ range(0; $MX|length) as $i |
+                                       ($MX[$i] | capture("^(?<p>[0-9]+)\\s+(?<h>.+)$")) as $m
+                                       | {priority: ($m.p|tonumber), value: ($m.h|sub("\\.$";""))}
+                                     ] else . end)
+    | (if ($TXT|length)>0 then .TXT= [ range(0; $TXT|length)as $i | {priority:(($i+1)*10), value: $TXT[$i]} ] else . end)
+  '
+}
+
+# ---------- vars ----------
+dns::vars() {
+  DOMAIN="$(dns::_yq '.domain')"
+  HOSTNAME="$(dns::_yq '.hostname')"
+  IPV4="$(dns::_yq '.ipv4')"
+  [[ -z "$HOSTNAME" && -n "$DOMAIN" ]] && HOSTNAME="mail.$DOMAIN"
+
+  BEGET_LOGIN="$(dns::_yq '.beget.login')"
+  BEGET_PASSWORD="$(dns::_yq '.beget.password')"
+
+  # Selector: из manifest (если уже сгенерён), иначе s1
+  DKIM_SELECTOR="$(dns::manifest_get '.dns.selector')"; [[ -z "$DKIM_SELECTOR" ]] && DKIM_SELECTOR="s1"
+
+  # DMARC RUA: первый пользователь из vars, иначе hostmaster@
+  # DMARC RUA: первый ящик из users, потом acme_email, потом hostmaster@
+  PRIMARY_USER_EMAIL="$(yq -r '
+    (.users // [])                                  # массив или []
+    | (.[0] // {})                                  # первый объект или {}
+    | (.email // .login // "")                      # email > login
+  ' "$VARS_FILE" 2>/dev/null || echo "")"
+
+  if [[ -z "$PRIMARY_USER_EMAIL" || "$PRIMARY_USER_EMAIL" == "null" ]]; then
+    # пробуем acme_email
+    PRIMARY_USER_EMAIL="$(yq -r '.acme_email // ""' "$VARS_FILE" 2>/dev/null || echo "")"
+  fi
+  if [[ -z "$PRIMARY_USER_EMAIL" || "$PRIMARY_USER_EMAIL" == "null" ]]; then
+    PRIMARY_USER_EMAIL="hostmaster@${DOMAIN}"
+    log_info "DMARC: users/acme_email не заданы → используем ${PRIMARY_USER_EMAIL}"
+  else
+    log_info "DMARC: RUA будет ${PRIMARY_USER_EMAIL}"
+  fi
+
+  DMARC_VALUE="v=DMARC1; p=none; rua=mailto:${PRIMARY_USER_EMAIL}"
+
+  APEX_FQDN="$(dns::trimdot "$DOMAIN")"
+  MAIL_FQDN="$(dns::trimdot "$HOSTNAME")"
+  DKIM_FQDN="$(dns::trimdot "${DKIM_SELECTOR}._domainkey.$DOMAIN")"
+  DMARC_FQDN="$(dns::trimdot "_dmarc.$DOMAIN")"
+
+  [[ -n "$DOMAIN"   ]] || { log_error "domain не задан в $VARS_FILE"; exit 1; }
+  [[ -n "$HOSTNAME" ]] || { log_error "hostname не задан в $VARS_FILE"; exit 1; }
+  [[ -n "$IPV4"     ]] || { log_error "ipv4 не задан в $VARS_FILE"; exit 1; }
+}
+
+# ---------- Beget API ----------
+dns::api_ok(){ jq -e '.status=="success" and ((.answer.status//"success")=="success")' >/dev/null 2>&1; }
+dns::api_err(){ jq -r '.answer.errors? // .error? // .answer.error_text? // .error_text? // .result.message? // "unknown error"' 2>/dev/null; }
+
+dns::beget_post(){
+  local path="$1" json="$2"
+  local url="https://api.beget.com/api/dns/$path"
+  local data=(
+    -fsS --connect-timeout 15 --max-time 45 --retry 1 --retry-connrefused
+    -X POST "$url"
+    -d "login=$BEGET_LOGIN"
+    -d "passwd=$BEGET_PASSWORD"
+    -d "input_format=json"
+    -d "output_format=json"
+    --data-urlencode "input_data=$json"
+  )
+  curl "${data[@]}"
+}
+
+dns::get_apex(){
+  if [[ -z "$BEGET_LOGIN" || -z "$BEGET_PASSWORD" ]]; then
+    log_error "Не заданы beget.login / beget.password в $VARS_FILE"
+    exit 1
+  fi
+  dns::beget_post "getData" "$(jq -nc --arg f "$APEX_FQDN" '{fqdn:$f}')" || echo "{}"
+}
+
+dns::change_records(){
+  local fqdn="$1" payload_json="$2"
+  local wrapper; wrapper="$(jq -nc --arg f "$fqdn" --arg p "$payload_json" '{fqdn:$f,records:($p|fromjson)}' 2>/dev/null || echo '')"
+  [[ -n "$wrapper" ]] || { echo '{"status":"error","error_text":"bad payload json"}'; return 0; }
+  dns::beget_post "changeRecords" "$wrapper" || echo '{"status":"error","error_text":"curl failed"}'
+}
+
+# ---------- NS check ----------
+dns::check_ns() {
+  local ns_list; ns_list="$(dig NS +short "$APEX_FQDN" | sed 's/\.$//')"
+  if [[ -z "$ns_list" ]]; then
+    log_warn "NS для $APEX_FQDN не получены — пропускаю авто-DNS."
+    exit 0
+  fi
+  if ! grep -qi 'beget' <<<"$ns_list"; then
+    log_warn "Домен $APEX_FQDN делегирован НЕ на Beget:"
+    while IFS= read -r n; do echo "  - $n"; done <<<"$ns_list"
+    log_info "Пропускаю авто-DNS. Добавьте записи вручную."
+    exit 0
+  fi
+  log_info "NS у $APEX_FQDN — Beget:"
+  while IFS= read -r n; do echo "  - $n"; done <<<"$ns_list"
+}
+
+# ---------- read current apex ----------
+dns::read_current() {
+  dns::cleanup_beget_defaults
+  dns::cleanup_beget_defaults
+  log_info "Читаю APEX через Beget getData…"
+  APEX_RAW="$(dns::get_apex)"
+  [[ -n "$APEX_RAW" ]] || { log_error "Пустой ответ от getData"; exit 1; }
+  dns::api_ok <<<"$APEX_RAW" || { log_error "Beget API error: $(dns::api_err <<<"$APEX_RAW")"; exit 1; }
+
+  CUR_A="$(jq -r '.answer.result.records.A[]?    | (.value // .address)' <<<"$APEX_RAW" 2>/dev/null || true)"
+  CUR_MX="$(jq -r '.answer.result.records.MX[]?   | if .value then .value else ((.priority // .preference // 10|tostring)+" "+(.exchange // "")) end ' <<<"$APEX_RAW" 2>/dev/null || true)"
+  CUR_TXT="$(jq -r '.answer.result.records.TXT[]? | (.value // .txtdata)' <<<"$APEX_RAW" 2>/dev/null || true)"
+
+  CUR_SPF="$(printf '%s\n' "$CUR_TXT" | awk 'BEGIN{IGNORECASE=1} /^ *"?.*v=spf1/ {print; exit}')"
+}
+
+# ---------- cleanup Beget defaults ----------
+dns::cleanup_beget_defaults() {
+  [[ "$CLEAN_BEGET_DEFAULTS" == "true" ]] || { log_info "Cleanup Beget defaults: выключено"; return; }
+
+  # 1) autoconfig. и autodiscover.: сначала пробуем удалить все записи
+  for sub in autoconfig autodiscover; do
+    local fqdn="${sub}.${APEX_FQDN}"
+    if [[ "$DNS_DRY_RUN" == "true" ]]; then
+      log_info "[$fqdn] DRY-RUN cleanup (delete all records)"
+    else
+      local resp; resp="$(dns::change_records "$fqdn" "{}" || true)"
+      if [[ -z "$resp" || "$(jq -r '.status // empty' <<<"$resp")" != "success" ]]; then
+        log_warn "[$fqdn] delete не поддержан или ошибка API: $(dns::api_err <<<"$resp")"
+        if [[ "$BEGET_AUTOCONFIG_MODE" == "cname" ]]; then
+          # перезаписываем на CNAME → mail.<domain>
+          local payload; payload="$( jq -nc --arg v "$MAIL_FQDN" '{CNAME:[{priority:10, value:$v}]}' )"
+          resp="$(dns::change_records "$fqdn" "$payload" || true)"
+          if dns::api_ok <<<"$resp"; then
+            log_info "[$fqdn] переписан CNAME → ${MAIL_FQDN}"
+          else
+            log_warn "[$fqdn] не удалось перезаписать CNAME: $(dns::api_err <<<"$resp")"
+          fi
+        else
+          log_warn "[$fqdn] оставлен без изменений (BEGET_AUTOCONFIG_MODE=delete)"
+        fi
+      else
+        log_info "[$fqdn] удалён (records cleared)"
+      fi
+    fi
+  done
+
+  # 2) SPF redirect=beget.com → сбросим, дальше построим свой SPF
+  if [[ -n "${CUR_SPF:-}" ]] && grep -qiE '^ *"?v=spf1[[:space:]]+redirect=beget\.com' <<<"$CUR_SPF"; then
+    log_info "SPF: найден redirect=beget.com — будет заменён на наш SPF"
+    CUR_SPF=""
+  fi
+}
+# ---------- build desired ----------
+dns::build_desired() {
+  # DKIM value
+  DKIM_VALUE=""
+  if [[ -f "$MSA_DKIM_TXT" ]]; then
+    DKIM_VALUE="$(dns::sanitize_dkim_value <"$MSA_DKIM_TXT")"
+    DKIM_VALUE="$(printf '%s' "$DKIM_VALUE" | sed -E 's/^v=DKIM1[[:space:]]*/v=DKIM1; /; s/DKIM1;?[[:space:]]*p=/DKIM1; p=/')"
+  else
+    log_warn "DKIM-файл не найден или пуст: $MSA_DKIM_TXT — пропущу DKIM."
+  fi
+
+  # SPF итоговый
+  if [[ "$SPF_POLICY" == "warn" && -n "${CUR_SPF:-}" ]]; then
+    WANT_SPF="$CUR_SPF"
+  else
+    WANT_SPF="$(dns::merge_spf "${CUR_SPF:-}" "$MAIL_FQDN")"
+  fi
+
+  # payload’ы
+  PAYLOAD_MAIL="$(dns::mk_payload "$IPV4" "" "")"
+  APEX_A_LINES="$(printf '%s\n' "$CUR_A" | sed '/^$/d')"        # бережно сохраняем существующие A
+  APEX_MX_WANT="10 $MAIL_FQDN"
+  PAYLOAD_APEX="$(dns::mk_payload "$APEX_A_LINES" "$APEX_MX_WANT" "$WANT_SPF")"
+
+  PAYLOAD_DKIM="{}"
+  [[ -n "$DKIM_VALUE" ]] && PAYLOAD_DKIM="$(dns::mk_payload "" "" "$DKIM_VALUE")"
+
+  # DMARC: ifabsent → только если нет в публичном DNS
+  NEED_DMARC=true
+  if [[ "$DMARC_MODE" == "ifabsent" ]]; then
+    if dig +short TXT "$DMARC_FQDN" | grep -qi 'v=DMARC1'; then
+      NEED_DMARC=false
+      log_info "DMARC уже существует — пропускаю (ifabsent)."
+    fi
+  fi
+  PAYLOAD_DMARC="{}"
+  $NEED_DMARC && PAYLOAD_DMARC="$(dns::mk_payload "" "" "$DMARC_VALUE")"
+}
+
+# ---------- apply ----------
+dns::apply_one(){
+  local fqdn="$1" payload="$2"
+  if [[ -z "${payload//[[:space:]]/}" || "$payload" = "{}" ]]; then
+    log_info "[$fqdn] изменений нет"
+    return 0
+  fi
+  if [[ "$DNS_DRY_RUN" == "true" ]]; then
+    log_info "[$fqdn] DRY-RUN payload:"
+    echo "$payload" | jq -S .
+    return 0
+  fi
+  log_info "[$fqdn] changeRecords…"
+  local resp; resp="$(dns::change_records "$fqdn" "$payload" || true)"
+  [[ -n "$resp" ]] || { log_error "[$fqdn] пустой ответ от API"; exit 1; }
+  dns::api_ok <<<"$resp" || { [[ "${BEGET_DEBUG:-0}" == "1" ]] && echo "$resp" | jq -S . >&2; log_error "[$fqdn] ошибка: $(dns::api_err <<<"$resp")"; exit 1; }
+}
+
+dns::apply_all(){
+  dns::apply_one "$MAIL_FQDN"  "$PAYLOAD_MAIL"
+  dns::apply_one "$APEX_FQDN"  "$PAYLOAD_APEX"
+  [[ -n "$DKIM_VALUE" ]] && dns::apply_one "$DKIM_FQDN" "$PAYLOAD_DKIM"
+  $NEED_DMARC && dns::apply_one "$DMARC_FQDN" "$PAYLOAD_DMARC"
+}
+
+# ---------- verify ----------
+dns::verify() {
+  log_info "Верификация публичным DNS… (кеши могут задерживать)"
+  local a_ok="fail" mx_ok="fail" spf_ok="fail"
+  dig +short A   "$MAIL_FQDN" | grep -Fxq "$IPV4" && a_ok="ok"
+  dig +short MX  "$APEX_FQDN" | sed 's/\.$//' | grep -Eq "^[[:space:]]*10[[:space:]]+$MAIL_FQDN$" && mx_ok="ok"
+  dig +short TXT "$APEX_FQDN" | tr -d '"' | grep -qi '^v=spf1' && spf_ok="ok"
+  log_info "Итог проверки: A(mail)=$a_ok, MX(@)=${mx_ok}, SPF(@)=${spf_ok}"
+}
+
+# ---------- main ----------
+module::main() {
+  # флаги командной строки
+  for a in "$@"; do [[ "$a" == "--dry-run" ]] && DNS_DRY_RUN=true; done
+
+  dns::need
+  dns::vars
+  log_info "DNS Beget: domain=$DOMAIN, hostname=$HOSTNAME, ipv4=$IPV4, selector=$DKIM_SELECTOR, SPF_POLICY=$SPF_POLICY, TTL=$TTL_DEFAULT"
+  [[ "$DNS_DRY_RUN" == "true" ]] && log_info "Режим DRY-RUN"
+
+  dns::check_ns
+  dns::read_current
+  dns::cleanup_beget_defaults
+  dns::cleanup_beget_defaults
+  dns::build_desired
+  dns::apply_all
+  dns::verify
+  log_info "DNS Beget: готово."
+}
+
+module::main "$@"
+
+==================== КОНЕЦ: ./install-smtp/modules/09_beget_dns.sh ======================
+
+

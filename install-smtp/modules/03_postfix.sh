@@ -19,6 +19,9 @@ ERROR(){ _log ERROR "$*"; }
 
 INFO "Пишу /etc/mailname = ${HOSTNAME}"
 printf '%s\n' "${HOSTNAME}" | tee /etc/mailname >/dev/null
+INFO "Устанавливаю системный hostname = ${HOSTNAME}"
+run_cmd hostnamectl set-hostname "${HOSTNAME}"
+echo "${HOSTNAME}" | run_cmd tee /etc/hostname >/dev/null
 
 INFO "Postfix: базовая конфигурация и TLS-жёсткость (TLS1.2+)"
 postconf -e myhostname="${HOSTNAME}"
