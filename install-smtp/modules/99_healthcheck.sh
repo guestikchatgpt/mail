@@ -161,12 +161,18 @@ module::main() {
     log_warn "HEALTHCHECK: есть проблемы (rc=$rc)"
   fi
 
-  # По умолчанию не валим пайплайн, чтобы 100_report.sh отработал
-  if [[ "$HEALTHCHECK_STRICT" == "true" ]]; then
-    exit "$rc"
+  # мягкий режим по умолчанию: не роняем пайплайн
+  if [[ "${HEALTHCHECK_STRICT:-false}" == "true" ]]; then
+    return "$rc"
   else
-    exit 0
+    return 0
   fi
 }
 
-module::main "$@"
+# вызывать так, чтобы при прямом запуске скрипта код возврата сохранился,
+# а при source — не происходил exit из родительского процесса
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  module::main "$@"; exit $?
+else
+  module::main "$@"; return 0
+fi
