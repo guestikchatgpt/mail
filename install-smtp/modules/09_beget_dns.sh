@@ -51,6 +51,21 @@ dns::sanitize_dkim_value() {
   | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
 }
 
+# Собирает корректную DKIM TXT из файла s1.txt (или /var/local/msa/dkim.txt)
+dns::dkim_txt_from_file() {
+  local file="${1:-$MSA_DKIM_TXT}"
+  [[ -s "$file" ]] || { echo ""; return 1; }
+
+  local p
+  p="$(tr -d '\r\n\"' < "$file" \
+        | sed -n 's/.*p=\([A-Za-z0-9+\/=]\+\).*/\1/p' \
+        | head -n1)"
+  [[ -n "$p" ]] || { echo ""; return 1; }
+
+  printf 'v=DKIM1; k=rsa; p=%s' "$p"
+}
+
+
 dns::merge_spf() {
   local spf="$1" host="$2"
   if [[ -z "$spf" ]]; then echo "v=spf1 mx a:${host} ~all"; return; fi
@@ -148,7 +163,7 @@ dns::cleanup_beget_defaults() {
 
 # ---------- build desired ----------
 dns::build_desired() {
-  DKIM_VALUE=""; [[ -f "$MSA_DKIM_TXT" ]] && DKIM_VALUE="$(dns::sanitize_dkim_value <"$MSA_DKIM_TXT")"
+  DKIM_VALUE=""; DKIM_VALUE="$(dns::dkim_txt_from_file "$MSA_DKIM_TXT" || true)"
   WANT_SPF="$(dns::merge_spf "${CUR_SPF:-}" "$MAIL_FQDN")"
 
   # apex = A + MX + SPF

@@ -99,8 +99,8 @@ dkim::wire_postfix() {
   run_cmd postconf -e "milter_protocol=6"
   run_cmd postconf -e "milter_default_action=accept"
 
-  local sockets="${DKIM_SOCK}"
-  [[ -S /var/spool/postfix/opendmarc/opendmarc.sock ]] && sockets="${sockets},${DMARC_SOCK}"
+  local sockets_inbound="${DKIM_SOCK}"
+  [[ -S /var/spool/postfix/opendmarc/opendmarc.sock ]] && sockets_inbound="${sockets_inbound},${DMARC_SOCK}"
 
   # впишем DKIM (и DMARC, если есть) в начало списка milters
   local have; have="$(postconf -h smtpd_milters || true)"
@@ -114,14 +114,14 @@ dkim::wire_postfix() {
       have="${have},${DMARC_SOCK}"
     fi
   fi
-  run_cmd postconf -e "smtpd_milters=${have}"
-  run_cmd postconf -e "non_smtpd_milters=${have}"
+
+  run_cmd postconf -e "smtpd_milters=${sockets_inbound}"
+  run_cmd postconf -e "non_smtpd_milters=${DKIM_SOCK}"
 
   run_cmd postconf -P "submission/inet/milter_macro_daemon_name=ORIGINATING"
   run_cmd postconf -P "smtps/inet/milter_macro_daemon_name=ORIGINATING"
-  run_cmd postconf -P "submission/inet/smtpd_milters=${sockets}"
-  run_cmd postconf -P "smtps/inet/smtpd_milters=${sockets}"
-
+  run_cmd postconf -P "submission/inet/smtpd_milters=${DKIM_SOCK}"
+  run_cmd postconf -P "smtps/inet/smtpd_milters=${DKIM_SOCK}"
   run_cmd systemctl reload postfix || run_cmd systemctl restart postfix
 }
 
