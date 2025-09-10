@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 04_dovecot.sh — Dovecot: passwd-file, SMTP AUTH, Maildir и первичная инициализация
+# 04_dovecot.sh — Dovecot: passwd-file, SMTP AUTH, Maildir, LMTP и первичная инициализация
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -76,14 +76,42 @@ protocols = imap lmtp sieve pop3
 EOF
 }
 
+dovecot::enable_lmtp_listener() {
+  # LMTP-сокет для Postfix в его chroot (/var/spool/postfix)
+  cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-lmtp.conf
+service lmtp {
+  unix_listener /var/spool/postfix/private/dovecot-lmtp {
+    mode = 0600
+    user = postfix
+    group = postfix
+  }
+}
+EOF
+  run_cmd install -d -m 0750 -o postfix -g postfix /var/spool/postfix/private
+}
+
+dovecot::ensure_namespace() {
+  # Автопапки со special-use, чтобы клиенты их видели сразу
+  cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-namespace.conf
+namespace inbox {
+  inbox = yes
+  mailbox Sent   { auto = subscribe; special_use = \Sent }
+  mailbox Drafts { auto = subscribe; special_use = \Drafts }
+  mailbox Junk   { auto = subscribe; special_use = \Junk }
+  mailbox Trash  { auto = subscribe; special_use = \Trash }
+}
+EOF
+}
+
 dovecot::init_maildirs_and_inbox() {
   # создаём корень ящика и Maildir для всех пользователей (до первого логина)
   while IFS=$'\t' read -r LOGIN _; do
     [[ -n "${LOGIN:-}" ]] || continue
     local d="/var/vmail/${LOGIN#*@}/${LOGIN%@*}"
 
-    run_cmd install -d -m 0750 -o vmail -g vmail "$d"
-    run_cmd install -d -m 0750 -o vmail -g vmail "$d/Maildir"/{cur,new,tmp}
+    run_cmd install -d -m 0700 -o vmail -g vmail "$d"
+    run_cmd install -d -m 0700 -o vmail -g vmail "$d/Maildir"/{cur,new,tmp}
+    run_cmd chmod -R u=rwX,go-rwx "$d"
 
     doveadm mailbox create -u "$LOGIN" INBOX >/dev/null 2>&1 || true
     log_info "Dovecot: подготовлен Maildir для ${LOGIN}"
@@ -110,6 +138,8 @@ module::main() {
   dovecot::enable_passwdfile_auth
   dovecot::postfix_auth_socket
   dovecot::ensure_mail_location
+  dovecot::enable_lmtp_listener
+  dovecot::ensure_namespace
   dovecot::init_maildirs_and_inbox
   dovecot::restart_and_selftest
 }

@@ -108,7 +108,7 @@ parse_args() {
       --dry-run)
         DRY_RUN=true; shift;;
       --healthcheck|-m)
-        # Совместимость: -m healthcheck
+        # Совместимость: -м healthcheck
         if [[ "$1" == "-m" ]]; then
           [[ $# -ge 2 ]] || die "-m требует значение (install|healthcheck|print-dns)"
           MODE="$2"; shift 2
