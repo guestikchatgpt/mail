@@ -95,10 +95,23 @@ dovecot::ensure_namespace() {
   cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/dovecot/conf.d/90-msa-namespace.conf
 namespace inbox {
   inbox = yes
-  mailbox Sent   { auto = subscribe; special_use = \Sent }
-  mailbox Drafts { auto = subscribe; special_use = \Drafts }
-  mailbox Junk   { auto = subscribe; special_use = \Junk }
-  mailbox Trash  { auto = subscribe; special_use = \Trash }
+
+  mailbox Sent {
+    auto = subscribe
+    special_use = \Sent
+  }
+  mailbox Drafts {
+    auto = subscribe
+    special_use = \Drafts
+  }
+  mailbox Junk {
+    auto = subscribe
+    special_use = \Junk
+  }
+  mailbox Trash {
+    auto = subscribe
+    special_use = \Trash
+  }
 }
 EOF
 }
