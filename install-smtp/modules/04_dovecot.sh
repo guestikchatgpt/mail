@@ -116,16 +116,48 @@ namespace inbox {
 EOF
 }
 
+dovecot::ensure_vmail_root() {
+  # Нормализуем корень, если уже существовал как root:root
+  run_cmd mkdir -p /var/vmail
+  run_cmd chown vmail:vmail /var/vmail
+  run_cmd chmod 0750 /var/vmail
+}
+
 dovecot::init_maildirs_and_inbox() {
   # создаём корень ящика и Maildir для всех пользователей (до первого логина)
   while IFS=$'\t' read -r LOGIN _; do
     [[ -n "${LOGIN:-}" ]] || continue
-    local d="/var/vmail/${LOGIN#*@}/${LOGIN%@*}"
 
-    run_cmd install -d -m 0700 -o vmail -g vmail "$d"
-    run_cmd install -d -m 0700 -o vmail -g vmail "$d/Maildir"/{cur,new,tmp}
-    run_cmd chmod -R u=rwX,go-rwx "$d"
+    local domain="${LOGIN#*@}"
+    local user="${LOGIN%@*}"
+    local domain_dir="/var/vmail/${domain}"
+    local user_dir="${domain_dir}/${user}"
+    local maildir="${user_dir}/Maildir"
 
+    # слой 1: доменная папка
+    run_cmd install -d -m 0750 "${domain_dir}"
+    run_cmd chown vmail:vmail "${domain_dir}"
+    run_cmd chmod 0750 "${domain_dir}"
+
+    # слой 2: пользовательская папка
+    run_cmd install -d -m 0750 "${user_dir}"
+    run_cmd chown vmail:vmail "${user_dir}"
+    run_cmd chmod 0750 "${user_dir}"
+
+    # слой 3: Maildir + subdirs (cur/new/tmp)
+    run_cmd install -d -m 0750 "${maildir}"
+    run_cmd chown vmail:vmail "${maildir}"
+    run_cmd chmod 0750 "${maildir}"
+
+    run_cmd install -d -m 0750 "${maildir}/cur" "${maildir}/new" "${maildir}/tmp"
+    run_cmd chown -R vmail:vmail "${maildir}/cur" "${maildir}/new" "${maildir}/tmp"
+    run_cmd chmod 0750 "${maildir}/cur" "${maildir}/new" "${maildir}/tmp"
+
+    # финальная зачистка прав на уровне user_dir (на случай гонок и старых папок)
+    run_cmd chown -R vmail:vmail "${user_dir}"
+    run_cmd find "${user_dir}" -type d -print0 | xargs -0 chmod 0750
+
+    # создаём INBOX (после прав!)
     doveadm mailbox create -u "$LOGIN" INBOX >/dev/null 2>&1 || true
     log_info "Dovecot: подготовлен Maildir для ${LOGIN}"
   done < <(yq -r '.users[] | [.login, .password] | @tsv' "${VARS_FILE}")
@@ -138,10 +170,18 @@ dovecot::restart_and_selftest() {
   local u p
   u="$(dovecot::_yq '.users[0].login')"
   p="$(dovecot::_yq '.users[0].password')"
+
   if doveadm auth test -x service=smtp "$u" "$p" >/dev/null 2>&1; then
     log_info "Dovecot: SMTP AUTH OK (${u})"
   else
     log_warn "Dovecot: SMTP AUTH FAIL (${u}) — см. /var/log/mail.log"
+  fi
+
+  # мини-проверка INBOX
+  if doveadm mailbox list -u "$u" 2>/dev/null | grep -q '^INBOX$'; then
+    log_info "Dovecot: INBOX присутствует (${u})"
+  else
+    log_warn "Dovecot: INBOX не найден (${u})"
   fi
 }
 
@@ -153,6 +193,7 @@ module::main() {
   dovecot::ensure_mail_location
   dovecot::enable_lmtp_listener
   dovecot::ensure_namespace
+  dovecot::ensure_vmail_root
   dovecot::init_maildirs_and_inbox
   dovecot::restart_and_selftest
 }
