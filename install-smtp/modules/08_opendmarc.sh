@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+IFS=$'
+	'
 
 MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 . "${MOD_DIR}/../lib/common.sh"
 : "${VARS_FILE:?}"
 
-# modules/08_opendmarc.sh — OpenDMARC milter
-# shellcheck shell=bash
-set -Eeuo pipefail
-IFS=$'\n\t'
+opendmarc::_yq(){ yq -r "$1" "${VARS_FILE}"; }
+
+opendmarc::vars(){ HOSTNAME="$(opendmarc::_yq '.hostname // ("mail." + .domain)')"; }
 
 opendmarc::write_conf() {
   local cfg="/etc/opendmarc.conf" tmp; tmp="$(mktemp)"
@@ -17,7 +18,7 @@ opendmarc::write_conf() {
 AuthservID ${HOSTNAME}
 TrustedAuthservIDs ${HOSTNAME}
 Socket local:/var/spool/postfix/opendmarc/opendmarc.sock
-UserID opendmarc
+UserID opendmarc:postfix
 UMask 007
 Syslog true
 SoftwareHeader true
@@ -40,7 +41,7 @@ opendmarc::systemd_override() {
 RuntimeDirectory=opendmarc
 RuntimeDirectoryMode=0755
 User=opendmarc
-Group=opendmarc
+Group=postfix
 ExecStart=
 ExecStart=/usr/sbin/opendmarc -c /etc/opendmarc.conf -l
 EOF
@@ -49,23 +50,23 @@ EOF
 }
 
 opendmarc::wire_postfix() {
-  local want="unix:/var/spool/postfix/opendmarc/opendmarc.sock"
-  local cur
-  cur="$(postconf -h smtpd_milters || true)"
-  [[ "$cur" == *"/opendmarc/opendmarc.sock"* ]] || run_cmd postconf -e "smtpd_milters=${cur:+$cur,}$want"
-  cur="$(postconf -h non_smtpd_milters || true)"
-  [[ "$cur" == *"/opendmarc/opendmarc.sock"* ]] || run_cmd postconf -e "non_smtpd_milters=${cur:+$cur,}$want"
+  local sock_postfix="unix:/opendmarc/opendmarc.sock"
   run_cmd postconf -e "milter_default_action=accept"
   run_cmd postconf -e "milter_protocol=6"
+  local cur
+  cur="$(postconf -h smtpd_milters || true)"
+  [[ "$cur" == *"/opendmarc/opendmarc.sock"* ]] || run_cmd postconf -e "smtpd_milters=${cur:+$cur,}${sock_postfix}"
+  # DMARC не нужен для non_smtpd и MSA
 }
 
 opendmarc::restart() {
   run_cmd systemctl enable --now opendmarc
   run_cmd systemctl restart opendmarc
+  run_cmd systemctl reload postfix || true
 }
 
-# ENTRYPOINT
-log_info "OpenDMARC: настраиваю milter и сервис"
+log_info "OpenDMARC: настройка"
+opendmarc::vars
 opendmarc::write_conf
 opendmarc::prepare_paths
 opendmarc::systemd_override

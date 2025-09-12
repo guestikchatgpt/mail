@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Module 05_dkim.sh — OpenDKIM: ключи, таблицы, конфиг, systemd-override, интеграция с Postfix
 set -Eeuo pipefail
-IFS=$'\n\t'
+IFS=$'
+	'
 
 MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 . "${MOD_DIR}/../lib/common.sh"
@@ -14,8 +15,9 @@ dkim::vars() {
   SELECTOR="$(dkim::_yq '.dkim_selector // "s1"')"
   HOSTNAME="$(dkim::_yq '.hostname // ("mail." + .domain)')"
   IPV4="$(dkim::_yq '.ipv4')"
-  DKIM_SOCK="unix:/var/spool/postfix/opendkim/opendkim.sock"
-  DMARC_SOCK="unix:/var/spool/postfix/opendmarc/opendmarc.sock"
+  # Сокеты: для демона — абсолютный путь (вне chroot), для Postfix — путь внутри chroot
+  DKIM_SOCK_DAEMON="local:/var/spool/postfix/opendkim/opendkim.sock"
+  DKIM_SOCK_POSTFIX="unix:/opendkim/opendkim.sock"
   : "${DOMAIN:?}"; : "${SELECTOR:?}"; : "${HOSTNAME:?}"; : "${IPV4:?}"
 }
 
@@ -36,21 +38,22 @@ dkim::ensure_key() {
 }
 
 dkim::write_tables() {
-  # KeyTable: <keyname> <domain>:<selector>:<path_to_private_key>
-  # Ключевое имя = домен (переносимо и понятно)
-  printf '%s\n' \
+  printf '%s
+' \
     "${DOMAIN} ${DOMAIN}:${SELECTOR}:/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private" \
     | run_cmd install -D -m 0644 /dev/stdin /etc/opendkim/KeyTable
 
-  # SigningTable: обычный file:-маппинг без regex — универсально на всех сборках
   {
-    printf '%s\t%s\n' "info@${DOMAIN}" "${DOMAIN}"
-    printf '%s\t%s\n' "@${DOMAIN}"      "${DOMAIN}"
-    printf '%s\t%s\n' "${DOMAIN}"       "${DOMAIN}"
+    printf '%s	%s
+' "info@${DOMAIN}" "${DOMAIN}"
+    printf '%s	%s
+' "@${DOMAIN}"      "${DOMAIN}"
+    printf '%s	%s
+' "${DOMAIN}"       "${DOMAIN}"
   } | run_cmd install -D -m 0644 /dev/stdin /etc/opendkim/SigningTable
 
-  # TrustedHosts
-  printf '%s\n' "127.0.0.1" "::1" "localhost" "${HOSTNAME}" "${IPV4}" \
+  printf '%s
+' "127.0.0.1" "::1" "localhost" "${HOSTNAME}" "${IPV4}" \
     | run_cmd install -D -m 0644 /dev/stdin /etc/opendkim/TrustedHosts
 
   run_cmd chown opendkim:opendkim /etc/opendkim/{KeyTable,SigningTable,TrustedHosts}
@@ -58,7 +61,7 @@ dkim::write_tables() {
 }
 
 dkim::write_conf() {
-  cat <<'EOF' | run_cmd install -D -m 0644 /dev/stdin /etc/opendkim.conf
+  cat <<EOF | run_cmd install -D -m 0644 /dev/stdin /etc/opendkim.conf
 Syslog                  yes
 LogWhy                  yes
 UMask                   007
@@ -66,7 +69,7 @@ Mode                    sv
 AutoRestart             yes
 PidFile                 /run/opendkim/opendkim.pid
 
-Socket                  local:/var/spool/postfix/opendkim/opendkim.sock
+Socket                  ${DKIM_SOCK_DAEMON}
 UserID                  opendkim:postfix
 
 KeyTable                file:/etc/opendkim/KeyTable
@@ -99,27 +102,19 @@ dkim::wire_postfix() {
   run_cmd postconf -e "milter_protocol=6"
   run_cmd postconf -e "milter_default_action=accept"
 
-  # гарантируем, что сокеты заданы даже если dkim::vars не вызывали
-  : "${DKIM_SOCK:=unix:/var/spool/postfix/opendkim/opendkim.sock}"
-  : "${DMARC_SOCK:=unix:/var/spool/postfix/opendmarc/opendmarc.sock}"
+  # inbound (25): включаем DKIM-verify; DMARC подключит свой модуль позже
+  local cur
+  cur="$(postconf -h smtpd_milters || true)"
+  [[ "$cur" == *"/opendkim/opendkim.sock"* ]] || run_cmd postconf -e "smtpd_milters=${cur:+$cur,}${DKIM_SOCK_POSTFIX}"
 
-  # inbound (25): DKIM + DMARC (если сокет DMARC реально существует)
-  local sockets_inbound
-  sockets_inbound="${DKIM_SOCK}"
-  if [[ -S /var/spool/postfix/opendmarc/opendmarc.sock ]]; then
-    sockets_inbound="${sockets_inbound},${DMARC_SOCK}"
-  fi
+  # локальная отправка — DKIM-sign
+  run_cmd postconf -e "non_smtpd_milters=${DKIM_SOCK_POSTFIX}"
 
-  # порт 25 (вход): DKIM(+DMARC)
-  run_cmd postconf -e "smtpd_milters=${sockets_inbound}"
-  # локальная отправка через pickup/cleanup — только DKIM
-  run_cmd postconf -e "non_smtpd_milters=${DKIM_SOCK}"
-
-  # MSA (587/465): только DKIM (DMARC на исходящих не нужен)
+  # MSA (587/465): только DKIM (подпись исходящих)
   run_cmd postconf -P "submission/inet/milter_macro_daemon_name=ORIGINATING"
   run_cmd postconf -P "smtps/inet/milter_macro_daemon_name=ORIGINATING"
-  run_cmd postconf -P "submission/inet/smtpd_milters=${DKIM_SOCK}"
-  run_cmd postconf -P "smtps/inet/smtpd_milters=${DKIM_SOCK}"
+  run_cmd postconf -P "submission/inet/smtpd_milters=${DKIM_SOCK_POSTFIX}"
+  run_cmd postconf -P "smtps/inet/smtpd_milters=${DKIM_SOCK_POSTFIX}"
 
   run_cmd systemctl reload postfix || run_cmd systemctl restart postfix
 }
@@ -134,13 +129,12 @@ dkim::restart_and_export_txt() {
   log_info "OpenDKIM: TXT экспортирован в /var/local/msa/dkim.txt"
 }
 
+
 dkim::sanity() {
-  # доступ postfix к сокету
   sudo -u postfix test -w /var/spool/postfix/opendkim/opendkim.sock || {
     log_error "postfix не имеет доступа к opendkim.sock"
     exit 1
   }
-  # быстрый смок: нет ли в логах fresh 'no signing table match'
   if journalctl -u opendkim --since -5min 2>/dev/null | grep -qi 'no signing table match'; then
     log_error "OpenDKIM: обнаружен 'no signing table match' за последние 5 минут"
     exit 1
