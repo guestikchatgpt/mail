@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# 03_postfix.sh — базовая настройка Postfix + виртуальные ящики + LMTP,
+# включение Postscreen/DNSBL на 25-м порту и безопасные overrides для submission/587 и smtps/465.
+# Политика: IPv4-only, строгая санитария SMTP на 25-м, никаких DNSBL/greylist на submission/SMTPS.
+
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -34,12 +38,13 @@ postconf -e inet_interfaces=all
 postconf -e inet_protocols=ipv4
 postconf -e smtp_address_preference=ipv4
 postconf -e smtp_bind_address="${IPV4}"
+postconf -e mynetworks='127.0.0.0/8'
 postconf -e smtpd_banner='$myhostname ESMTP'
+
+# SASL (AUTH через Dovecot) + TLS
 postconf -e smtpd_sasl_type=dovecot
 postconf -e smtpd_sasl_path=private/auth
 postconf -e smtpd_sasl_auth_enable=yes
-postconf -e smtpd_recipient_restrictions='permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination'
-postconf -e mynetworks='127.0.0.0/8'
 postconf -e smtpd_tls_auth_only=yes
 postconf -e smtpd_tls_security_level=may
 postconf -e smtp_tls_security_level=may
@@ -50,6 +55,25 @@ postconf -e smtpd_tls_ciphers=high
 postconf -e smtp_tls_ciphers=high
 postconf -e smtpd_tls_mandatory_ciphers=high
 
+# ===== Санитария SMTP на входящем 25-м =====
+postconf -e \
+  "smtpd_helo_required=yes" \
+  "disable_vrfy_command=yes" \
+  "smtpd_delay_reject=yes" \
+  "smtpd_sender_restrictions=reject_non_fqdn_sender,reject_unknown_sender_domain" \
+  "smtpd_client_restrictions=warn_if_reject reject_unknown_reverse_client_hostname" \
+  "smtpd_relay_restrictions=permit_mynetworks,permit_sasl_authenticated,defer_unauth_destination" \
+  "smtpd_recipient_restrictions=reject_unknown_recipient_domain,reject_unauth_destination,reject_unlisted_recipient"
+
+# Лёгкие rate-limits (anvil)
+postconf -e \
+  "anvil_rate_time_unit=60s" \
+  "smtpd_client_connection_rate_limit=30" \
+  "smtpd_client_connection_count_limit=20" \
+  "smtpd_client_message_rate_limit=100" \
+  "smtpd_soft_error_limit=10" \
+  "smtpd_hard_error_limit=20"
+
 # ===== Виртуальные домены/ящики + LMTP доставка в Dovecot =====
 postconf -e virtual_mailbox_base='/var/vmail'
 postconf -e virtual_mailbox_maps='hash:/etc/postfix/virtual_mailbox_maps'
@@ -59,16 +83,16 @@ postconf -e "virtual_uid_maps=static:${VMAIL_UID}"
 postconf -e "virtual_gid_maps=static:${VMAIL_GID}"
 
 # Карта доменов
-tmp_domains="$(mktemp)"
+TMP_DOMAINS="$(mktemp)"
 {
   printf '%s %s\n' "${DOMAIN}" "OK"
-} | sed '/^$/d' | sort -u > "${tmp_domains}"
-install -m 0644 "${tmp_domains}" /etc/postfix/virtual_domains
-rm -f "${tmp_domains}"
+} | sed '/^$/d' | sort -u > "${TMP_DOMAINS}"
+install -m 0644 "${TMP_DOMAINS}" /etc/postfix/virtual_domains
+rm -f "${TMP_DOMAINS}"
 postmap hash:/etc/postfix/virtual_domains
 
 # Карта ящиков из vars.yaml: user@domain  domain/user/
-tmp_vmaps="$(mktemp)"
+TMP_VMAPS="$(mktemp)"
 while IFS= read -r login; do
   [[ -n "${login}" ]] || continue
   if [[ "${login}" != *"@"* ]]; then
@@ -78,40 +102,68 @@ while IFS= read -r login; do
   domain_part="${login#*@}"
   printf '%s %s/%s/\n' "${login}" "${domain_part}" "${local_part}"
 done < <(yq -r '.users[]? | .login // ""' "${VARS_FILE}") \
-  | sort -u > "${tmp_vmaps}"
-install -m 0644 "${tmp_vmaps}" /etc/postfix/virtual_mailbox_maps
-rm -f "${tmp_vmaps}"
+  | sort -u > "${TMP_VMAPS}"
+install -m 0644 "${TMP_VMAPS}" /etc/postfix/virtual_mailbox_maps
+rm -f "${TMP_VMAPS}"
 postmap hash:/etc/postfix/virtual_mailbox_maps
 
-# master.cf: явно включаем три сервиса. На некоторых образах по умолчанию postscreen — уберём.
+# ===== master.cf: включаем Postscreen на 25, smtpd как pass, и службы для DNSBL/TLS proxy =====
 postconf -X smtp/inet || true
-postconf -M smtp/inet="smtp inet n - n - - smtpd"
+postconf -M smtp/inet='smtp      inet  n  -  y  -  -  postscreen'
+postconf -M smtpd/pass='smtpd    pass  -  -  y  -  -  smtpd'
+postconf -M dnsblog/unix='dnsblog unix  -  -  y  -  -  dnsblog'
+postconf -M tlsproxy/unix='tlsproxy unix -  -  y  -  -  tlsproxy'
 
+# Postscreen/DNSBL (только на 25-м)
+postconf -e \
+  "postscreen_greet_wait=5s" \
+  "postscreen_greet_action=enforce" \
+  "postscreen_non_smtp_command_action=drop" \
+  "postscreen_pipelining_action=enforce" \
+  "postscreen_bare_newline_action=drop" \
+  "postscreen_blacklist_action=drop" \
+  "postscreen_cache_map=btree:/var/lib/postfix/postscreen_cache" \
+  "postscreen_dnsbl_ttl=1h" \
+  "postscreen_cache_retention_time=7d" \
+  "postscreen_dnsbl_action=enforce" \
+  "postscreen_dnsbl_threshold=2" \
+  "postscreen_dnsbl_sites=bl.spamcop.net*2 b.barracudacentral.org*2 list.dnswl.org*-1"
+
+# ===== submission/587: аутентифицированный исходящий, без DNSBL =====
 postconf -X submission/inet || true
-postconf -M submission/inet="submission inet n - n - - smtpd"
-postconf -P submission/inet/smtpd_tls_security_level=encrypt
-postconf -P submission/inet/smtpd_sasl_auth_enable=yes
-postconf -P submission/inet/smtpd_client_restrictions="permit_sasl_authenticated,reject"
+postconf -M submission/inet='submission inet n - n - - smtpd'
+postconf -P 'submission/inet/syslog_name=postfix/submission'
+postconf -P 'submission/inet/smtpd_tls_security_level=encrypt'
+postconf -P 'submission/inet/smtpd_sasl_auth_enable=yes'
+postconf -P 'submission/inet/smtpd_relay_restrictions=permit_sasl_authenticated,reject'
+postconf -P 'submission/inet/smtpd_recipient_restrictions=permit_sasl_authenticated,reject_unauth_destination'
+postconf -P 'submission/inet/smtpd_client_restrictions=permit_sasl_authenticated,reject'
+postconf -P 'submission/inet/milter_macro_daemon_name=ORIGINATING'
 
+# ===== smtps/465: аналогично (если используешь) =====
 postconf -X smtps/inet || true
-postconf -M smtps/inet="smtps inet n - n - - smtpd"
-postconf -P smtps/inet/smtpd_tls_wrappermode=yes
-postconf -P smtps/inet/smtpd_sasl_auth_enable=yes
-postconf -P smtps/inet/smtpd_client_restrictions="permit_sasl_authenticated,reject"
+postconf -M smtps/inet='smtps inet n - n - - smtpd'
+postconf -P 'smtps/inet/syslog_name=postfix/smtps'
+postconf -P 'smtps/inet/smtpd_tls_wrappermode=yes'
+postconf -P 'smtps/inet/smtpd_sasl_auth_enable=yes'
+postconf -P 'smtps/inet/smtpd_relay_restrictions=permit_sasl_authenticated,reject'
+postconf -P 'smtps/inet/smtpd_recipient_restrictions=permit_sasl_authenticated,reject_unauth_destination'
+postconf -P 'smtps/inet/smtpd_client_restrictions=permit_sasl_authenticated,reject'
+postconf -P 'smtps/inet/milter_macro_daemon_name=ORIGINATING'
 
 INFO "Postfix: включаю сервис и перезапускаю"
-systemctl enable --now postfix
-systemctl restart postfix
+run_cmd systemctl enable --now postfix
+run_cmd systemctl restart postfix
 
-INFO "Postfix: virtual_*:"
+INFO "Postfix: virtual_* (контроль)"
 postconf | egrep '^(virtual_mailbox_base|virtual_mailbox_maps|virtual_mailbox_domains|virtual_transport|virtual_uid_maps|virtual_gid_maps)'
 
 # ждём порты до 10 сек
 ok25=0 ok465=0 ok587=0
 for i in {1..10}; do
-  ss -ltn 2>/dev/null | grep -qE '[:.]25[[:space:]]'  && ok25=1 || true
-  ss -ltn 2>/dev/null | grep -qE '[:.]465[[:space:]]' && ok465=1 || true
-  ss -ltn 2>/dev/null | grep -qE '[:.]587[[:space:]]' && ok587=1 || true
+  ss -ltn 2>/dev/null | grep -qE '[:\.]25[[:space:]]'  && ok25=1 || true
+  ss -ltn 2>/dev/null | grep -qE '[:\.]465[[:space:]]' && ok465=1 || true
+  ss -ltn 2>/dev/null | grep -qE '[:\.]587[[:space:]]' && ok587=1 || true
   (( ok25 && ok465 && ok587 )) && break
   sleep 1
 done
@@ -125,3 +177,6 @@ if ! (( ok25 && ok465 && ok587 )); then
   journalctl -u postfix -n 200 --no-pager -o cat || true
   exit 1
 fi
+
+INFO "Postfix: ключевые параметры (контроль)"
+postconf -n | egrep -i '^(inet_protocols|smtp_address_preference|smtp_bind_address|mynetworks|smtpd_helo_required|disable_vrfy_command|smtpd_delay_reject|smtpd_(relay|recipient|sender|client)_restrictions|postscreen_|anvil_|smtpd_tls_security_level|smtp_tls_security_level)'
