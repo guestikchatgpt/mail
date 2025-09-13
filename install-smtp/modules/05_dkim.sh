@@ -18,6 +18,7 @@ dkim::vars() {
   SELECTOR="$(dkim::_yq '.dkim_selector // "s1"')"
   HOSTNAME="$(dkim::_yq '.hostname // ("mail." + .domain)')"
   IPV4="$(dkim::_yq '.ipv4')"
+  DKIM_KEY_BITS="$(dkim::_yq '.dkim_key_bits // 2048')"
 
   # Демон слушает абсолютный путь (вне chroot Postfix):
   DKIM_SOCK_DAEMON="local:/var/spool/postfix/opendkim/opendkim.sock"
@@ -25,7 +26,7 @@ dkim::vars() {
   DKIM_SOCK_POSTFIX_INBOUND="unix:/opendkim/opendkim.sock"                       # 25/tcp (chroot=y)
   DKIM_SOCK_POSTFIX_MSA="unix:/var/spool/postfix/opendkim/opendkim.sock"         # 587/465 + non_smtpd (chroot=n)
 
-  : "${DOMAIN:?}"; : "${SELECTOR:?}"; : "${HOSTNAME:?}"; : "${IPV4:?}"
+  : "${DOMAIN:?}"; : "${SELECTOR:?}"; : "${HOSTNAME:?}"; : "${IPV4:?}"; : "${DKIM_KEY_BITS:?}"
 }
 
 dkim::prepare_dirs() {
@@ -37,8 +38,10 @@ dkim::ensure_key() {
   local dir="/etc/opendkim/keys/${DOMAIN}"
   local priv="${dir}/${SELECTOR}.private"
   if [[ ! -f "$priv" ]]; then
-    log_info "OpenDKIM: генерирую ключ 1024 бит (совместимо с большинством DNS панелей)"
-    run_cmd opendkim-genkey -b 1024 -s "${SELECTOR}" -d "${DOMAIN}" -D "${dir}"
+    local msg="OpenDKIM: генерирую ключ ${DKIM_KEY_BITS} бит"
+    [[ "${DKIM_KEY_BITS}" -eq 1024 ]] && msg+=" (совместимо с большинством DNS панелей)"
+    log_info "$msg"
+    run_cmd opendkim-genkey -b "${DKIM_KEY_BITS}" -s "${SELECTOR}" -d "${DOMAIN}" -D "${dir}"
     run_cmd chown opendkim:opendkim "${dir}/${SELECTOR}.private" "${dir}/${SELECTOR}.txt"
     run_cmd chmod 0600 "${dir}/${SELECTOR}.private"
   fi
@@ -83,7 +86,7 @@ InternalHosts           /etc/opendkim/TrustedHosts
 ExternalIgnoreList      /etc/opendkim/TrustedHosts
 
 Canonicalization        relaxed/relaxed
-MinimumKeyBits          1024
+MinimumKeyBits          ${DKIM_KEY_BITS}
 OversignHeaders         From
 TrustAnchorFile         /usr/share/dns/root.key
 EOF
