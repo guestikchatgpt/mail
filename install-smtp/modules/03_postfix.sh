@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-IFS=$'
-	'
+IFS=$'\n\t'
 
 MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 . "${MOD_DIR}/../lib/common.sh"
 : "${VARS_FILE:?}"
 
-_log() { printf '[%(%FT%TZ)T] [%s] %s
-' -1 "$1" "$2"; }
+_log() { printf '[%(%FT%TZ)T] [%s] %s\n' -1 "$1" "$2"; }
 INFO(){ _log INFO "$*"; }
 WARN(){ _log WARN "$*"; }
 ERROR(){ _log ERROR "$*"; }
@@ -18,8 +16,7 @@ ERROR(){ _log ERROR "$*"; }
 : "${IPV4:?}"
 
 INFO "Пишу /etc/mailname = ${HOSTNAME}"
-printf '%s
-' "${HOSTNAME}" | tee /etc/mailname >/dev/null
+printf '%s\n' "${HOSTNAME}" | tee /etc/mailname >/dev/null
 
 # UID/GID для vmail (без хардкода)
 VMAIL_UID="$(id -u vmail 2>/dev/null || true)"
@@ -84,8 +81,7 @@ postconf -e "virtual_gid_maps=static:${VMAIL_GID}"
 # Карта доменов
 TMP_DOMAINS="$(mktemp)"
 {
-  printf '%s %s
-' "${DOMAIN}" "OK"
+  printf '%s %s\n' "${DOMAIN}" "OK"
 } | sed '/^$/d' | sort -u > "${TMP_DOMAINS}"
 install -m 0644 "${TMP_DOMAINS}" /etc/postfix/virtual_domains
 rm -f "${TMP_DOMAINS}"
@@ -100,8 +96,7 @@ while IFS= read -r login; do
   fi
   local_part="${login%@*}"
   domain_part="${login#*@}"
-  printf '%s %s/%s/
-' "${login}" "${domain_part}" "${local_part}"
+  printf '%s %s/%s/\n' "${login}" "${domain_part}" "${local_part}"
 done < <(yq -r '.users[]? | .login // ""' "${VARS_FILE}") \
   | sort -u > "${TMP_VMAPS}"
 install -m 0644 "${TMP_VMAPS}" /etc/postfix/virtual_mailbox_maps
