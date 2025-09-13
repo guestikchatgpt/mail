@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 MOD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 . "${MOD_DIR}/../lib/common.sh"
-: "${VARS_FILE:?}"
 
 # modules/01_prepare.sh — подготовка системы (пакеты, vmail, IPv6-off)
 # shellcheck shell=bash
-set -Eeuo pipefail
-IFS=$'\n\t'
 
 prepare::system_packages() {
   log_info "Обновляю индекс пакетов и ставлю базовые зависимости"
@@ -82,9 +78,17 @@ prepare::add_postfix_to_milter_groups() {
   run_cmd usermod -a -G opendmarc postfix
 }
 
+module::main() {
+  set -Eeuo pipefail
+  IFS=$'\n\t'
+  : "${VARS_FILE:?}"
 
-# --- ENTRYPOINT ---
-prepare::system_packages
-prepare::create_vmail_user
-prepare::disable_ipv6
-prepare::add_postfix_to_milter_groups
+  prepare::system_packages
+  prepare::create_vmail_user
+  prepare::disable_ipv6
+  prepare::add_postfix_to_milter_groups
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  module::main "$@"
+fi
