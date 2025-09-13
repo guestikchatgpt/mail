@@ -20,6 +20,7 @@ acme_email: noc@example.com
 
 # DKIM
 dkim_selector: s1               # селектор для 05_dkim.sh
+dkim_key_bits: 2048            # размер ключа DKIM (1024 для совместимости с устаревшими DNS)
 
 # Beget API для 09_beget_dns.sh
 beget:
